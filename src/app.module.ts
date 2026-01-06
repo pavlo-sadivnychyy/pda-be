@@ -10,7 +10,7 @@ import { ConfigModule } from '@nestjs/config';
 
 @Module({
   // imports: [PrismaModule, UsersModule, OrganizationsModule, KnowledgeBaseModule, ChatModule, ConfigModule.forRoot({ isGlobal: true })],
-  imports: [PrismaModule, UsersModule, OrganizationsModule],
+  imports: [PrismaModule],
   controllers: [AppController],
   providers: [AppService],
 })
