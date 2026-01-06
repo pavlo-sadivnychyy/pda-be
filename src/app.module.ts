@@ -9,7 +9,8 @@ import { ChatModule } from "./chat/chat.module";
 import { ConfigModule } from '@nestjs/config';
 
 @Module({
-  imports: [PrismaModule, UsersModule, OrganizationsModule, KnowledgeBaseModule, ChatModule, ConfigModule.forRoot({ isGlobal: true })],
+  // imports: [PrismaModule, UsersModule, OrganizationsModule, KnowledgeBaseModule, ChatModule, ConfigModule.forRoot({ isGlobal: true })],
+  imports: [PrismaModule, UsersModule, OrganizationsModule],
   controllers: [AppController],
   providers: [AppService],
 })
