@@ -1,0 +1,263 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrganizationRole {
+  OWNER
+  MEMBER
+}
+
+enum OrganizationMemberStatus {
+  ACTIVE
+  INVITED
+  INACTIVE
+}
+
+model User {
+  id                  String    @id @default(cuid())
+  authProvider        String
+  authUserId          String    @unique
+  email               String    @unique
+  emailVerified       Boolean   @default(false)
+  firstName           String?
+  lastName            String?
+  fullName            String?
+  avatarUrl           String?
+  locale              String? // "uk-UA"
+  timezone            String? // "Europe/Kyiv"
+  jobTitle            String?
+  phone               String?
+  onboardingCompleted Boolean   @default(false)
+  lastLoginAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // членство в організаціях (через UserOrganization)
+  organizations UserOrganization[]
+
+  // юзер може бути власником тільки ОДНІЄЇ організації
+  ownedOrganization Organization? @relation("OwnerOrganizations")
+
+  documents    Document[]
+  chatSessions ChatSession[]
+}
+
+model Organization {
+  id                  String  @id @default(cuid())
+  name                String
+  slug                String  @unique
+  logoUrl             String?
+  industry            String?
+  description         String?
+  websiteUrl          String?
+  country             String?
+  city                String?
+  timeZone            String?
+  defaultLanguage     String? // "uk"
+  defaultCurrency     String? // "UAH"
+  primaryContactName  String?
+  primaryContactEmail String?
+  primaryContactPhone String?
+
+  // Нові поля бізнес-профілю організації
+  businessNiche       String? // Ніша бізнесу
+  servicesDescription String? // Опис послуг
+  targetAudience      String? // Цільова аудиторія
+  brandStyle          String? // Брендовий стиль
+
+  // Один юзер може бути власником тільки однієї організації
+  ownerId String @unique
+  owner   User   @relation("OwnerOrganizations", fields: [ownerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members         UserOrganization[]
+  businessProfile BusinessProfile?
+  subscriptions   Subscription[]
+  documents       Document[]
+  chatSessions    ChatSession[]
+}
+
+model UserOrganization {
+  id              String                   @id @default(cuid())
+  userId          String
+  organizationId  String
+  invitedByUserId String?
+  invitedAt       DateTime?
+  joinedAt        DateTime?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  role            OrganizationRole         @default(MEMBER)
+  status          OrganizationMemberStatus @default(ACTIVE)
+
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([userId, organizationId])
+}
+
+model BusinessProfile {
+  id                    String   @id @default(cuid())
+  organizationId        String   @unique
+  tagline               String?
+  niche                 String?
+  longDescription       String?
+  targetAudienceSummary String?
+  targetMarkets         Json? // [{ country: "UA", segment: "SMB" }]
+  businessModel         String? // "subscription", "services", etc.
+  averageCheck          Int? // in defaultCurrency
+  defaultPostLength     String? // "short" | "medium" | "long"
+  preferredPlatforms    Json? // ["instagram", "email", "linkedin"]
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+}
+
+model SubscriptionPlan {
+  id                     String   @id @default(cuid())
+  name                   String
+  slug                   String   @unique
+  description            String?
+  stripeProductId        String?
+  stripePriceIdMonthly   String?
+  stripePriceIdYearly    String?
+  monthlyAiTokensLimit   Int?
+  monthlyAiRequestsLimit Int?
+  maxUsersPerOrg         Int?
+  storageLimitMb         Int?
+  maxDocuments           Int?
+  maxChatSessions        Int?
+  isDefault              Boolean  @default(false)
+  isPublic               Boolean  @default(true)
+  sortOrder              Int      @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  organizationId       String
+  planId               String
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  status               String // "trialing" | "active" | ...
+  trialStart           DateTime?
+  trialEnd             DateTime?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean   @default(false)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id])
+  plan         SubscriptionPlan @relation(fields: [planId], references: [id])
+}
+
+model Document {
+  id             String @id @default(cuid())
+  organizationId String
+  createdById    String
+
+  title        String
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+
+  storageKey String
+  source     DocumentSource @default(UPLOAD)
+  status     DocumentStatus @default(PROCESSING)
+
+  description String?
+  language    String?
+  tags        String[] @default([])
+
+  pages      Int?
+  chunkCount Int  @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  createdBy    User            @relation(fields: [createdById], references: [id])
+  chunks       DocumentChunk[]
+}
+
+model DocumentChunk {
+  id         String @id @default(cuid())
+  documentId String
+
+  chunkIndex Int
+  content    String
+  tokenCount Int?
+
+  embedding Float[] @default([])
+
+  createdAt DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id])
+
+  @@index([documentId])
+  @@index([chunkIndex])
+}
+
+enum DocumentSource {
+  UPLOAD
+  MANUAL
+  IMPORT
+}
+
+enum DocumentStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum ChatSessionStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum ChatMessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+model ChatSession {
+  id             String       @id @default(cuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+
+  createdBy   User   @relation(fields: [createdById], references: [id])
+  createdById String
+
+  title  String
+  status ChatSessionStatus @default(ACTIVE)
+
+  messages ChatMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ChatMessage {
+  id String @id @default(cuid())
+
+  session   ChatSession @relation(fields: [sessionId], references: [id])
+  sessionId String
+
+  role     ChatMessageRole
+  content  String
+  metadata Json?
+
+  createdAt DateTime @default(now())
+}
