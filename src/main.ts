@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import * as process from 'node:process';
 
 async function bootstrap() {
   // const app = await NestFactory.create(AppModule, {cors: true});
@@ -10,6 +11,6 @@ async function bootstrap() {
     credentials: true,
   });
 
-  await app.listen(3000);
+  await app.listen(process.env.PORT || 3000);
 }
 bootstrap().catch((error) => console.log(error));
