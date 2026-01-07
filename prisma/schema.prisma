@@ -45,6 +45,9 @@ model User {
 
   documents    Document[]
   chatSessions ChatSession[]
+
+  // тудушки юзера
+  todoTasks    TodoTask[]
 }
 
 model Organization {
@@ -260,4 +263,44 @@ model ChatMessage {
   metadata Json?
 
   createdAt DateTime @default(now())
+}
+
+// ===== TODO календар =====
+
+enum TodoStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TodoPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model TodoTask {
+  id             String  @id @default(cuid())
+  userId         String
+  organizationId String? // просто String, без реляції в Organization
+
+  title       String
+  description String?
+
+  startAt     DateTime
+  endAt       DateTime?
+
+  status      TodoStatus   @default(PENDING)
+  priority    TodoPriority @default(MEDIUM)
+
+  isPinned    Boolean      @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id])
+
+  @@index([userId, startAt])
+  @@index([organizationId, startAt])
 }
