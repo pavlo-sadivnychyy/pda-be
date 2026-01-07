@@ -416,4 +416,133 @@ export class InvoicesService {
       },
     });
   }
+
+  async getAnalytics(params: {
+    organizationId: string;
+    from?: string;
+    to?: string;
+  }) {
+    const { organizationId, from, to } = params;
+
+    if (!organizationId) {
+      throw new BadRequestException('organizationId є обовʼязковим');
+    }
+
+    const now = new Date();
+    const parsedFrom = from ? this.parseDate(from) : undefined;
+    const parsedTo = to ? this.parseDate(to) : undefined;
+
+    // За замовчуванням — останні 6 місяців
+    const dateFrom =
+      parsedFrom ?? new Date(now.getFullYear(), now.getMonth() - 5, 1);
+    const dateTo = parsedTo ?? now;
+
+    const invoices = await this.prisma.invoice.findMany({
+      where: {
+        organizationId,
+        issueDate: {
+          gte: dateFrom,
+          lte: dateTo,
+        },
+      },
+      select: {
+        status: true,
+        total: true,
+        issueDate: true,
+        paidAt: true,
+        currency: true,
+      },
+    });
+
+    const toNumber = (v: any): number => {
+      if (v == null) return 0;
+      if (typeof v === 'number') return v;
+      if (typeof v === 'string') {
+        const n = parseFloat(v);
+        return isNaN(n) ? 0 : n;
+      }
+      // Prisma.Decimal
+      // @ts-ignore
+      if (v && typeof v.toNumber === 'function') {
+        // @ts-ignore
+        return v.toNumber();
+      }
+      return 0;
+    };
+
+    let totalPaid = 0;
+    let totalOutstanding = 0;
+    let totalOverdue = 0;
+
+    const monthMap = new Map<
+      string,
+      {
+        issuedTotal: number;
+        paidTotal: number;
+      }
+    >();
+
+    const getMonthKey = (d: Date) => {
+      const y = d.getFullYear();
+      const m = d.getMonth() + 1;
+      return `${y}-${m.toString().padStart(2, '0')}`; // 2026-01
+    };
+
+    let currency: string | null = null;
+
+    for (const inv of invoices) {
+      const amount = toNumber(inv.total);
+      currency = currency || inv.currency || null;
+
+      // Загальні суми
+      if (inv.status === InvoiceStatus.PAID) {
+        totalPaid += amount;
+      }
+      if (
+        inv.status === InvoiceStatus.SENT ||
+        inv.status === InvoiceStatus.OVERDUE
+      ) {
+        totalOutstanding += amount;
+      }
+      if (inv.status === InvoiceStatus.OVERDUE) {
+        totalOverdue += amount;
+      }
+
+      // Виставлено по місяцях (issueDate)
+      const issueKey = getMonthKey(inv.issueDate);
+      if (!monthMap.has(issueKey)) {
+        monthMap.set(issueKey, { issuedTotal: 0, paidTotal: 0 });
+      }
+      monthMap.get(issueKey)!.issuedTotal += amount;
+
+      // Оплачено по місяцях (paidAt, якщо є)
+      if (inv.status === InvoiceStatus.PAID && inv.paidAt) {
+        const paidKey = getMonthKey(inv.paidAt);
+        if (!monthMap.has(paidKey)) {
+          monthMap.set(paidKey, { issuedTotal: 0, paidTotal: 0 });
+        }
+        monthMap.get(paidKey)!.paidTotal += amount;
+      }
+    }
+
+    const monthly = Array.from(monthMap.entries())
+      .map(([month, v]) => ({
+        month, // '2026-01'
+        issuedTotal: v.issuedTotal,
+        paidTotal: v.paidTotal,
+      }))
+      .sort((a, b) => (a.month < b.month ? -1 : 1));
+
+    return {
+      from: dateFrom.toISOString(),
+      to: dateTo.toISOString(),
+      currency: currency || 'UAH',
+      totals: {
+        paid: totalPaid,
+        outstanding: totalOutstanding,
+        overdue: totalOverdue,
+      },
+      monthly,
+    };
+  }
 }

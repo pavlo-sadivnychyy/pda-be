@@ -24,6 +24,21 @@ export class InvoicesController {
     private readonly invoicePdfService: InvoicePdfService,
   ) {}
 
+  @Get('analytics')
+  async getAnalytics(
+    @Query('organizationId') organizationId: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    const analytics = await this.invoicesService.getAnalytics({
+      organizationId,
+      from,
+      to,
+    });
+
+    return { analytics };
+  }
+
   // POST /invoices
   @Post()
   async create(@Body() dto: CreateInvoiceDto) {
