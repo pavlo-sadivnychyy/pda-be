@@ -7,15 +7,22 @@ import {
   Patch,
   Post,
   Query,
+  StreamableFile,
 } from '@nestjs/common';
 import { InvoicesService } from './invoices.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
+import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus } from '@prisma/client';
+import { InvoicePdfService } from './invoice-pdf.service';
+import * as fs from 'fs';
 
 @Controller('invoices')
 export class InvoicesController {
-  constructor(private readonly invoicesService: InvoicesService) {}
+  constructor(
+    private readonly invoicesService: InvoicesService,
+    private readonly invoicePdfService: InvoicePdfService,
+  ) {}
 
   // POST /invoices
   @Post()
@@ -57,7 +64,47 @@ export class InvoicesController {
   // DELETE /invoices/:id
   @Delete(':id')
   async remove(@Param('id') id: string) {
-    const invoice = await this.invoicesService.remove(id);
-    return { success: true };
+    const result = await this.invoicesService.remove(id);
+    return { success: true, deleted: result };
+  }
+
+  // ===== ЖИТТЄВИЙ ЦИКЛ =====
+
+  // POST /invoices/:id/send
+  @Post(':id/send')
+  async send(@Param('id') id: string) {
+    const invoice = await this.invoicesService.send(id);
+    return { invoice };
+  }
+
+  // POST /invoices/:id/mark-paid
+  @Post(':id/mark-paid')
+  async markPaid(@Param('id') id: string, @Body() dto: MarkInvoicePaidDto) {
+    const invoice = await this.invoicesService.markPaid(id, dto);
+    return { invoice };
+  }
+
+  // POST /invoices/:id/cancel
+  @Post(':id/cancel')
+  async cancel(@Param('id') id: string) {
+    const invoice = await this.invoicesService.cancel(id);
+    return { invoice };
+  }
+
+  // ===== PDF =====
+
+  // GET /invoices/:id/pdf
+  // Якщо PDF ще немає — згенерує; потім віддасть файл.
+  @Get(':id/pdf')
+  async getPdf(@Param('id') id: string): Promise<StreamableFile> {
+    const { document, filePath } =
+      await this.invoicePdfService.getOrCreatePdfForInvoice(id);
+
+    const file = fs.createReadStream(filePath);
+
+    return new StreamableFile(file, {
+      disposition: `inline; filename="${document.originalName}"`,
+      type: 'application/pdf',
+    });
   }
 }

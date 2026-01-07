@@ -391,6 +391,10 @@ model Invoice {
   pdfDocumentId String?   @unique
   pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
 
+  // нові поля життєвого циклу
+  sentAt DateTime?
+  paidAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

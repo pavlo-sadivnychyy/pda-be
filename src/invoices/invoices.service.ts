@@ -6,6 +6,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
+import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus, Prisma } from '@prisma/client';
 
 @Injectable()
@@ -144,6 +145,10 @@ export class InvoicesService {
 
         status: status ?? InvoiceStatus.DRAFT,
         notes: notes ?? null,
+
+        // нові поля
+        sentAt: null,
+        paidAt: null,
 
         items: {
           create: items.map((item, index) => ({
@@ -306,13 +311,109 @@ export class InvoicesService {
   }
 
   async remove(id: string) {
-    // якщо захочеш soft-delete — тут можна буде змінити
     await this.prisma.invoiceItem.deleteMany({
       where: { invoiceId: id },
     });
 
     return this.prisma.invoice.delete({
       where: { id },
+    });
+  }
+
+  // ============ НОВІ МЕТОДИ ЖИТТЄВОГО ЦИКЛУ ============
+
+  async send(id: string) {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException('Інвойс не знайдено');
+    }
+
+    if (
+      invoice.status === InvoiceStatus.PAID ||
+      invoice.status === InvoiceStatus.CANCELLED
+    ) {
+      throw new BadRequestException(
+        `Не можна відправити інвойс зі статусом ${invoice.status}`,
+      );
+    }
+
+    return this.prisma.invoice.update({
+      where: { id },
+      data: {
+        status: InvoiceStatus.SENT,
+        sentAt: new Date(),
+      },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
+  }
+
+  async markPaid(id: string, dto: MarkInvoicePaidDto) {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException('Інвойс не знайдено');
+    }
+
+    if (invoice.status === InvoiceStatus.CANCELLED) {
+      throw new BadRequestException('Скасований інвойс не можна оплатити');
+    }
+
+    if (invoice.status === InvoiceStatus.PAID) {
+      throw new BadRequestException('Інвойс вже має статус PAID');
+    }
+
+    const paidAt =
+      dto.paidAt != null
+        ? (this.parseDate(dto.paidAt) ?? new Date())
+        : new Date();
+
+    return this.prisma.invoice.update({
+      where: { id },
+      data: {
+        status: InvoiceStatus.PAID,
+        paidAt,
+      },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
+  }
+
+  async cancel(id: string) {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException('Інвойс не знайдено');
+    }
+
+    if (invoice.status === InvoiceStatus.PAID) {
+      throw new BadRequestException('Оплачений інвойс не можна скасувати');
+    }
+
+    if (invoice.status === InvoiceStatus.CANCELLED) {
+      throw new BadRequestException('Інвойс вже скасовано');
+    }
+
+    return this.prisma.invoice.update({
+      where: { id },
+      data: {
+        status: InvoiceStatus.CANCELLED,
+      },
+      include: {
+        items: true,
+        client: true,
+      },
     });
   }
 }
