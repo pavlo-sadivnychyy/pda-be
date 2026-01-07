@@ -7,7 +7,7 @@ import {
   Patch,
   Post,
   Query,
-  StreamableFile,
+  Res,
 } from '@nestjs/common';
 import { InvoicesService } from './invoices.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -15,10 +15,13 @@ import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus } from '@prisma/client';
 import { InvoicePdfService } from './invoice-pdf.service';
-import * as fs from 'fs';
+import { S3Client } from '@aws-sdk/client-s3';
 
 @Controller('invoices')
 export class InvoicesController {
+  private readonly s3 = new S3Client({
+    region: process.env.S3_REGION || 'eu-central-1',
+  });
   constructor(
     private readonly invoicesService: InvoicesService,
     private readonly invoicePdfService: InvoicePdfService,
@@ -111,15 +114,16 @@ export class InvoicesController {
   // GET /invoices/:id/pdf
   // Якщо PDF ще немає — згенерує; потім віддасть файл.
   @Get(':id/pdf')
-  async getPdf(@Param('id') id: string): Promise<StreamableFile> {
-    const { document, filePath } =
+  async getPdf(@Param('id') id: string, @Res() res: any) {
+    const { document, pdfBuffer } =
       await this.invoicePdfService.getOrCreatePdfForInvoice(id);
 
-    const file = fs.createReadStream(filePath);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${document.originalName}"`,
+    );
 
-    return new StreamableFile(file, {
-      disposition: `inline; filename="${document.originalName}"`,
-      type: 'application/pdf',
-    });
+    res.end(pdfBuffer);
   }
 }

@@ -7,6 +7,8 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ================== ENUMS ==================
+
 enum OrganizationRole {
   OWNER
   MEMBER
@@ -17,6 +19,65 @@ enum OrganizationMemberStatus {
   INVITED
   INACTIVE
 }
+
+enum DocumentSource {
+  UPLOAD
+  MANUAL
+  IMPORT
+}
+
+enum DocumentStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum ChatSessionStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum ChatMessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum TodoStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TodoPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// Інвойси
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// Акти
+
+enum ActStatus {
+  DRAFT
+  SENT
+  SIGNED
+  CANCELLED
+}
+
+// ================== MODELS ==================
+
+// ---- User ----
 
 model User {
   id                  String    @id @default(cuid())
@@ -49,10 +110,13 @@ model User {
   todoTasks      TodoTask[]
   todoDailyPlans TodoDailyPlan[]
 
-  // інвойси / клієнти
-  clients         Client[]
-  createdInvoices Invoice[]
+  // фінансові сутності
+  clients  Client[]
+  invoices Invoice[]
+  acts     Act[]
 }
+
+// ---- Organization ----
 
 model Organization {
   id                  String  @id @default(cuid())
@@ -90,10 +154,13 @@ model Organization {
   documents       Document[]
   chatSessions    ChatSession[]
 
-  // інвойси / клієнти
+  // фінансові сутності
   clients  Client[]
   invoices Invoice[]
+  acts     Act[]
 }
+
+// ---- UserOrganization ----
 
 model UserOrganization {
   id              String                   @id @default(cuid())
@@ -113,6 +180,8 @@ model UserOrganization {
   @@unique([userId, organizationId])
 }
 
+// ---- BusinessProfile ----
+
 model BusinessProfile {
   id                    String   @id @default(cuid())
   organizationId        String   @unique
@@ -130,6 +199,8 @@ model BusinessProfile {
 
   organization Organization @relation(fields: [organizationId], references: [id])
 }
+
+// ---- SubscriptionPlan / Subscription ----
 
 model SubscriptionPlan {
   id                     String   @id @default(cuid())
@@ -173,6 +244,8 @@ model Subscription {
   plan         SubscriptionPlan @relation(fields: [planId], references: [id])
 }
 
+// ---- Documents ----
+
 model Document {
   id             String @id @default(cuid())
   organizationId String
@@ -201,8 +274,11 @@ model Document {
   createdBy    User            @relation(fields: [createdById], references: [id])
   chunks       DocumentChunk[]
 
-  // зворотній зв'язок до інвойсу (1-1)
+  // pdf-документ для інвойсу
   invoice Invoice? @relation("InvoiceDocument")
+
+  // pdf-документ для акта
+  act Act? @relation("ActDocument")
 }
 
 model DocumentChunk {
@@ -223,28 +299,7 @@ model DocumentChunk {
   @@index([chunkIndex])
 }
 
-enum DocumentSource {
-  UPLOAD
-  MANUAL
-  IMPORT
-}
-
-enum DocumentStatus {
-  PROCESSING
-  READY
-  FAILED
-}
-
-enum ChatSessionStatus {
-  ACTIVE
-  ARCHIVED
-}
-
-enum ChatMessageRole {
-  USER
-  ASSISTANT
-  SYSTEM
-}
+// ---- Chat ----
 
 model ChatSession {
   id             String       @id @default(cuid())
@@ -276,20 +331,124 @@ model ChatMessage {
   createdAt DateTime @default(now())
 }
 
+// ---- Clients ----
+
+model Client {
+  id             String  @id @default(cuid())
+  organizationId String
+  createdById    String? // <-- робимо опціональним
+
+  name        String
+  contactName String?
+  email       String?
+  phone       String?
+  address     String?
+  taxNumber   String?
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  createdBy    User?        @relation(fields: [createdById], references: [id])
+
+  invoices Invoice[]
+  acts     Act[]
+}
+
+// ---- Invoices ----
+
+model Invoice {
+  id             String  @id @default(cuid())
+  organizationId String
+  clientId       String? // може бути null, якщо інвойс без клієнта
+  createdById    String
+
+  number    String    @unique
+  issueDate DateTime
+  dueDate   DateTime?
+
+  currency String        @default("UAH")
+  status   InvoiceStatus @default(DRAFT)
+
+  subtotal  Decimal  @db.Decimal(18, 2)
+  taxAmount Decimal? @db.Decimal(18, 2)
+  total     Decimal  @db.Decimal(18, 2)
+
+  notes  String?
+  sentAt DateTime?
+  paidAt DateTime?
+
+  pdfDocumentId String?   @unique
+  pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  client       Client?      @relation(fields: [clientId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  items InvoiceItem[]
+  acts  Act[]
+}
+
+model InvoiceItem {
+  id        String @id @default(cuid())
+  invoiceId String
+
+  name        String
+  description String?
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(18, 2)
+  taxRate     Decimal? @db.Decimal(5, 2) // у відсотках
+  lineTotal   Decimal  @db.Decimal(18, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
+}
+
+// ---- Acts ----
+
+model Act {
+  id             String @id @default(cuid())
+  organizationId String
+  clientId       String
+  createdById    String
+
+  /// Номер акта, наприклад "0001" або "2026-01-001"
+  number     String
+  /// Необовʼязкова назва, наприклад "Акт наданих послуг за січень"
+  title      String?
+  /// Період, за який складено акт
+  periodFrom DateTime?
+  periodTo   DateTime?
+
+  /// Загальна сума за актом
+  total    Decimal @db.Decimal(18, 2)
+  currency String  @default("UAH")
+
+  status ActStatus @default(DRAFT)
+  notes  String?
+
+  /// Опційний звʼязок з інвойсом, з якого взяли позиції/суму
+  relatedInvoiceId String?
+  relatedInvoice   Invoice? @relation(fields: [relatedInvoiceId], references: [id])
+
+  /// PDF-документ, згенерований для цього акта
+  pdfDocumentId String?   @unique
+  pdfDocument   Document? @relation("ActDocument", fields: [pdfDocumentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  client       Client       @relation(fields: [clientId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+}
+
 // ===== TODO календар =====
-
-enum TodoStatus {
-  PENDING
-  IN_PROGRESS
-  DONE
-  CANCELLED
-}
-
-enum TodoPriority {
-  LOW
-  MEDIUM
-  HIGH
-}
 
 model TodoTask {
   id             String  @id @default(cuid())
@@ -329,101 +488,4 @@ model TodoDailyPlan {
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
-}
-
-// ============ ІНВОЙСИ / КЛІЄНТИ ============
-
-enum InvoiceStatus {
-  DRAFT
-  SENT
-  PAID
-  OVERDUE
-  CANCELLED
-}
-
-model Client {
-  id             String @id @default(cuid())
-  organizationId String
-  createdById    String
-
-  // базова інформація про клієнта
-  name        String // назва компанії або ПІБ
-  contactName String? // контактна особа, якщо є
-  email       String?
-  phone       String?
-  taxNumber   String? // ЄДРПОУ / ІПН / VAT
-  address     String?
-  notes       String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  organization Organization @relation(fields: [organizationId], references: [id])
-  createdBy    User         @relation(fields: [createdById], references: [id])
-
-  invoices Invoice[]
-
-  @@index([organizationId])
-  @@index([createdById])
-}
-
-model Invoice {
-  id String @id @default(cuid())
-
-  organizationId String
-  createdById    String
-  clientId       String?
-
-  number    String // "INV-2026-0001" (унікальний в межах організації)
-  issueDate DateTime
-  dueDate   DateTime?
-
-  currency  String // "UAH", "USD", etc.
-  subtotal  Decimal  @db.Decimal(14, 2)
-  taxAmount Decimal? @db.Decimal(14, 2)
-  total     Decimal  @db.Decimal(14, 2)
-
-  status InvoiceStatus @default(DRAFT)
-
-  notes String?
-
-  // опційний лінк на PDF-документ в таблиці Document
-  pdfDocumentId String?   @unique
-  pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
-
-  // нові поля життєвого циклу
-  sentAt DateTime?
-  paidAt DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  organization Organization @relation(fields: [organizationId], references: [id])
-  createdBy    User         @relation(fields: [createdById], references: [id])
-  client       Client?      @relation(fields: [clientId], references: [id])
-
-  items InvoiceItem[]
-
-  @@unique([organizationId, number]) // номер унікальний в межах організації
-  @@index([organizationId])
-  @@index([clientId])
-  @@index([createdById])
-  @@index([status])
-}
-
-model InvoiceItem {
-  id        String @id @default(cuid())
-  invoiceId String
-
-  name        String // назва товару/послуги
-  description String?
-  quantity    Decimal  @db.Decimal(10, 2)
-  unitPrice   Decimal  @db.Decimal(14, 2)
-  taxRate     Decimal? @db.Decimal(5, 2) // наприклад 20.00 (%)
-
-  lineTotal Decimal @db.Decimal(14, 2) // quantity * unitPrice (+tax)
-
-  invoice Invoice @relation(fields: [invoiceId], references: [id])
-
-  @@index([invoiceId])
 }

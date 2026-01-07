@@ -10,6 +10,7 @@ import { ConfigModule } from '@nestjs/config';
 import { TodoModule } from './todo/todo.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { ClientsModule } from './clients/clients.module';
+import { ActsModule } from './acts/acts.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ClientsModule } from './clients/clients.module';
     KnowledgeBaseModule,
     ChatModule,
     ClientsModule,
+    ActsModule,
     InvoicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
   ],
