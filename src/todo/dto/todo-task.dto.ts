@@ -9,6 +9,11 @@ import {
 } from 'class-validator';
 
 export class CreateTodoTaskDto {
+  // хто власник задачі
+  @IsString()
+  @Length(1, 100)
+  userId: string;
+
   @IsString()
   @Length(1, 200)
   title: string;
