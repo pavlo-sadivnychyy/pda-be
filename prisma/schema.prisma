@@ -46,8 +46,8 @@ model User {
   documents    Document[]
   chatSessions ChatSession[]
 
-  // тудушки юзера
-  todoTasks    TodoTask[]
+  todoTasks      TodoTask[]
+  todoDailyPlans TodoDailyPlan[]
 }
 
 model Organization {
@@ -288,19 +288,34 @@ model TodoTask {
   title       String
   description String?
 
-  startAt     DateTime
-  endAt       DateTime?
+  startAt DateTime
+  endAt   DateTime?
 
-  status      TodoStatus   @default(PENDING)
-  priority    TodoPriority @default(MEDIUM)
+  status   TodoStatus   @default(PENDING)
+  priority TodoPriority @default(MEDIUM)
 
-  isPinned    Boolean      @default(false)
+  isPinned Boolean @default(false)
 
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  user        User         @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@index([userId, startAt])
   @@index([organizationId, startAt])
+}
+
+model TodoDailyPlan {
+  id     String @id @default(cuid())
+  userId String
+  date   String
+
+  summary     String
+  suggestions Json
+  timeline    Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
 }
