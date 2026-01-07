@@ -1,0 +1,318 @@
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateInvoiceDto } from './dto/create-invoice.dto';
+import { UpdateInvoiceDto } from './dto/update-invoice.dto';
+import { InvoiceStatus, Prisma } from '@prisma/client';
+
+@Injectable()
+export class InvoicesService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  private parseDate(dateStr?: string): Date | undefined {
+    if (!dateStr) return undefined;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) {
+      throw new BadRequestException(`Невалідна дата: ${dateStr}`);
+    }
+    return d;
+  }
+
+  private async generateInvoiceNumber(organizationId: string): Promise<string> {
+    const year = new Date().getFullYear();
+    const prefix = `INV-${year}-`;
+
+    const lastInvoice = await this.prisma.invoice.findFirst({
+      where: {
+        organizationId,
+        number: { startsWith: prefix },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { number: true },
+    });
+
+    let nextSeq = 1;
+
+    if (lastInvoice?.number) {
+      const lastSeqStr = lastInvoice.number.replace(prefix, '');
+      const parsed = parseInt(lastSeqStr, 10);
+      if (!isNaN(parsed)) {
+        nextSeq = parsed + 1;
+      }
+    }
+
+    const padded = nextSeq.toString().padStart(4, '0');
+    return `${prefix}${padded}`;
+  }
+
+  private calculateTotals(
+    items: {
+      quantity: number;
+      unitPrice: number;
+      taxRate?: number;
+    }[],
+  ): {
+    subtotal: Prisma.Decimal | number;
+    taxAmount: Prisma.Decimal | number;
+    total: Prisma.Decimal | number;
+    lineTotals: { lineTotal: number; taxRate?: number }[];
+  } {
+    if (!items || items.length === 0) {
+      throw new BadRequestException('Інвойс повинен мати хоча б одну позицію');
+    }
+
+    let subtotal = 0;
+    let taxAmount = 0;
+    const lineTotals: { lineTotal: number; taxRate?: number }[] = [];
+
+    for (const item of items) {
+      if (item.quantity <= 0) {
+        throw new BadRequestException('Кількість повинна бути більшою за 0');
+      }
+      if (item.unitPrice < 0) {
+        throw new BadRequestException('Ціна не може бути відʼємною');
+      }
+
+      const base = item.quantity * item.unitPrice;
+      const rate = item.taxRate ?? 0;
+      const lineTax = base * (rate / 100);
+      const lineTotal = base + lineTax;
+
+      subtotal += base;
+      taxAmount += lineTax;
+      lineTotals.push({ lineTotal, taxRate: item.taxRate });
+    }
+
+    const total = subtotal + taxAmount;
+
+    return {
+      subtotal,
+      taxAmount,
+      total,
+      lineTotals,
+    };
+  }
+
+  async create(dto: CreateInvoiceDto) {
+    const {
+      organizationId,
+      createdById,
+      items,
+      clientId,
+      issueDate,
+      dueDate,
+      currency,
+      status,
+      notes,
+    } = dto;
+
+    if (!organizationId || !createdById) {
+      throw new BadRequestException(
+        'organizationId та createdById є обовʼязковими',
+      );
+    }
+
+    if (!items || items.length === 0) {
+      throw new BadRequestException(
+        'Потрібно додати хоча б одну позицію інвойсу',
+      );
+    }
+
+    const issueDateParsed = this.parseDate(issueDate) ?? new Date();
+    const dueDateParsed = this.parseDate(dueDate);
+
+    const number = await this.generateInvoiceNumber(organizationId);
+    const { subtotal, taxAmount, total, lineTotals } =
+      this.calculateTotals(items);
+
+    return this.prisma.invoice.create({
+      data: {
+        organizationId,
+        createdById,
+        clientId: clientId ?? null,
+        number,
+        issueDate: issueDateParsed,
+        dueDate: dueDateParsed ?? null,
+        currency: currency ?? 'UAH',
+
+        subtotal,
+        taxAmount,
+        total,
+
+        status: status ?? InvoiceStatus.DRAFT,
+        notes: notes ?? null,
+
+        items: {
+          create: items.map((item, index) => ({
+            name: item.name,
+            description: item.description ?? null,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+            taxRate: item.taxRate ?? null,
+            lineTotal: lineTotals[index].lineTotal,
+          })),
+        },
+      },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
+  }
+
+  async findAll(params: {
+    organizationId: string;
+    status?: InvoiceStatus;
+    clientId?: string;
+  }) {
+    const { organizationId, status, clientId } = params;
+
+    if (!organizationId) {
+      throw new BadRequestException('organizationId є обовʼязковим');
+    }
+
+    return this.prisma.invoice.findMany({
+      where: {
+        organizationId,
+        status,
+        clientId: clientId ?? undefined,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
+  }
+
+  async findOne(id: string) {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException('Інвойс не знайдено');
+    }
+
+    return invoice;
+  }
+
+  async update(id: string, dto: UpdateInvoiceDto) {
+    const existing = await this.prisma.invoice.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+
+    if (!existing) {
+      throw new NotFoundException('Інвойс не знайдено');
+    }
+
+    const issueDateParsed = dto.issueDate
+      ? this.parseDate(dto.issueDate)
+      : undefined;
+    const dueDateParsed =
+      dto.dueDate === null
+        ? null
+        : dto.dueDate
+          ? this.parseDate(dto.dueDate)
+          : undefined;
+
+    let subtotal = existing.subtotal;
+    let taxAmount = existing.taxAmount ?? 0;
+    let total = existing.total;
+
+    let itemsCreate:
+      | {
+          name: string;
+          description?: string | null;
+          quantity: number;
+          unitPrice: number;
+          taxRate?: number | null;
+          lineTotal: number;
+        }[]
+      | undefined;
+
+    const hasItemsUpdate = dto.items && dto.items.length > 0;
+
+    if (hasItemsUpdate) {
+      const {
+        subtotal: s,
+        taxAmount: t,
+        total: tt,
+        lineTotals,
+      } = this.calculateTotals(dto.items!);
+      subtotal = s as any;
+      taxAmount = t as any;
+      total = tt as any;
+
+      itemsCreate = dto.items!.map((item, index) => ({
+        name: item.name,
+        description: item.description ?? null,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        taxRate: item.taxRate ?? null,
+        lineTotal: lineTotals[index].lineTotal,
+      }));
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      if (hasItemsUpdate) {
+        await tx.invoiceItem.deleteMany({
+          where: {
+            invoiceId: id,
+          },
+        });
+      }
+
+      const updated = await tx.invoice.update({
+        where: { id },
+        data: {
+          clientId: dto.clientId ?? undefined,
+          issueDate: issueDateParsed ?? undefined,
+          dueDate: dueDateParsed,
+          currency: dto.currency ?? undefined,
+          status: dto.status ?? undefined,
+          notes: dto.notes ?? undefined,
+          pdfDocumentId: dto.pdfDocumentId ?? undefined,
+
+          subtotal,
+          taxAmount,
+          total,
+
+          items:
+            hasItemsUpdate && itemsCreate
+              ? {
+                  create: itemsCreate,
+                }
+              : undefined,
+        },
+        include: {
+          items: true,
+          client: true,
+        },
+      });
+
+      return updated;
+    });
+  }
+
+  async remove(id: string) {
+    // якщо захочеш soft-delete — тут можна буде змінити
+    await this.prisma.invoiceItem.deleteMany({
+      where: { invoiceId: id },
+    });
+
+    return this.prisma.invoice.delete({
+      where: { id },
+    });
+  }
+}

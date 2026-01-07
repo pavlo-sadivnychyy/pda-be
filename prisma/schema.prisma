@@ -48,6 +48,10 @@ model User {
 
   todoTasks      TodoTask[]
   todoDailyPlans TodoDailyPlan[]
+
+  // інвойси / клієнти
+  clients         Client[]
+  createdInvoices Invoice[]
 }
 
 model Organization {
@@ -85,6 +89,10 @@ model Organization {
   subscriptions   Subscription[]
   documents       Document[]
   chatSessions    ChatSession[]
+
+  // інвойси / клієнти
+  clients  Client[]
+  invoices Invoice[]
 }
 
 model UserOrganization {
@@ -192,6 +200,9 @@ model Document {
   organization Organization    @relation(fields: [organizationId], references: [id])
   createdBy    User            @relation(fields: [createdById], references: [id])
   chunks       DocumentChunk[]
+
+  // зворотній зв'язок до інвойсу (1-1)
+  invoice Invoice? @relation("InvoiceDocument")
 }
 
 model DocumentChunk {
@@ -318,4 +329,97 @@ model TodoDailyPlan {
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
+}
+
+// ============ ІНВОЙСИ / КЛІЄНТИ ============
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+model Client {
+  id             String @id @default(cuid())
+  organizationId String
+  createdById    String
+
+  // базова інформація про клієнта
+  name        String // назва компанії або ПІБ
+  contactName String? // контактна особа, якщо є
+  email       String?
+  phone       String?
+  taxNumber   String? // ЄДРПОУ / ІПН / VAT
+  address     String?
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  invoices Invoice[]
+
+  @@index([organizationId])
+  @@index([createdById])
+}
+
+model Invoice {
+  id String @id @default(cuid())
+
+  organizationId String
+  createdById    String
+  clientId       String?
+
+  number    String // "INV-2026-0001" (унікальний в межах організації)
+  issueDate DateTime
+  dueDate   DateTime?
+
+  currency  String // "UAH", "USD", etc.
+  subtotal  Decimal  @db.Decimal(14, 2)
+  taxAmount Decimal? @db.Decimal(14, 2)
+  total     Decimal  @db.Decimal(14, 2)
+
+  status InvoiceStatus @default(DRAFT)
+
+  notes String?
+
+  // опційний лінк на PDF-документ в таблиці Document
+  pdfDocumentId String?   @unique
+  pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+  client       Client?      @relation(fields: [clientId], references: [id])
+
+  items InvoiceItem[]
+
+  @@unique([organizationId, number]) // номер унікальний в межах організації
+  @@index([organizationId])
+  @@index([clientId])
+  @@index([createdById])
+  @@index([status])
+}
+
+model InvoiceItem {
+  id        String @id @default(cuid())
+  invoiceId String
+
+  name        String // назва товару/послуги
+  description String?
+  quantity    Decimal  @db.Decimal(10, 2)
+  unitPrice   Decimal  @db.Decimal(14, 2)
+  taxRate     Decimal? @db.Decimal(5, 2) // наприклад 20.00 (%)
+
+  lineTotal Decimal @db.Decimal(14, 2) // quantity * unitPrice (+tax)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
 }

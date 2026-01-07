@@ -8,6 +8,8 @@ import { KnowledgeBaseModule } from './knowledge-base/knowledge-base.module';
 import { ChatModule } from './chat/chat.module';
 import { ConfigModule } from '@nestjs/config';
 import { TodoModule } from './todo/todo.module';
+import { InvoicesModule } from './invoices/invoices.module';
+import { ClientsModule } from './clients/clients.module';
 
 @Module({
   imports: [
@@ -17,6 +19,8 @@ import { TodoModule } from './todo/todo.module';
     OrganizationsModule,
     KnowledgeBaseModule,
     ChatModule,
+    ClientsModule,
+    InvoicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
   ],
   controllers: [AppController],
