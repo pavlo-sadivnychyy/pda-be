@@ -92,6 +92,15 @@ export class ActsService {
     return { items };
   }
 
+  async remove(id: string) {
+    const existing = await this.prisma.act.findUnique({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException('Акт не знайдено');
+    }
+
+    return this.prisma.act.delete({ where: { id } });
+  }
+
   async getById(id: string) {
     const act = await this.prisma.act.findUnique({
       where: { id },

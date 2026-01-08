@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -58,6 +59,12 @@ export class ActsController {
   async getById(@Param('id') id: string) {
     const { act } = await this.actsService.getById(id);
     return { act };
+  }
+
+  @Delete(':id')
+  async remove(@Param('id') id: string) {
+    const deleted = await this.actsService.remove(id);
+    return { success: true, deleted };
   }
 
   // GET /acts/:id/pdf

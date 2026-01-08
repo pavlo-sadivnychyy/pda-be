@@ -121,13 +121,35 @@ export class ClientsService {
   }
 
   async remove(id: string) {
-    // Якщо захочеш soft-delete — тут можна буде змінити
     const existing = await this.prisma.client.findUnique({
       where: { id },
+      select: { id: true, name: true },
     });
 
     if (!existing) {
       throw new NotFoundException('Клієнта не знайдено');
+    }
+
+    // 1) Перевіряємо акти
+    const actsCount = await this.prisma.act.count({
+      where: { clientId: id },
+    });
+
+    if (actsCount > 0) {
+      throw new BadRequestException(
+        `Не можна видалити клієнта: до нього прив’язано актів: ${actsCount}.`,
+      );
+    }
+
+    // 2) Перевіряємо інвойси (щоб не впиратися в Invoice_clientId_fkey)
+    const invoicesCount = await this.prisma.invoice.count({
+      where: { clientId: id },
+    });
+
+    if (invoicesCount > 0) {
+      throw new BadRequestException(
+        `Не можна видалити клієнта: до нього прив’язано інвойсів: ${invoicesCount}.`,
+      );
     }
 
     await this.prisma.client.delete({
