@@ -9,8 +9,10 @@ import {
   Query,
   UseInterceptors,
   UploadedFile,
+  Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 
 import { KnowledgeBaseService } from './knowledge-base.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
@@ -41,6 +43,22 @@ class UploadDocumentDto {
   tags?: string;
 }
 
+function normalizeMulterFilename(name: string) {
+  // Часто приходить latin1 -> перетворюємо у utf8
+  // Якщо вже utf8 — не зламається
+  try {
+    return Buffer.from(name, 'latin1').toString('utf8');
+  } catch {
+    return name;
+  }
+}
+
+function encodeRFC5987(str: string) {
+  return encodeURIComponent(str)
+    .replace(/['()]/g, escape)
+    .replace(/\*/g, '%2A');
+}
+
 @Controller('knowledge-base')
 export class KnowledgeBaseController {
   constructor(
@@ -68,7 +86,49 @@ export class KnowledgeBaseController {
     return { document: doc };
   }
 
-  // POST /knowledge-base/documents (JSON-only, технічний)
+  // ✅ Download: GET /knowledge-base/documents/:id/download
+  @Get('documents/:id/download')
+  async downloadDocument(@Param('id') id: string, @Res() res: Response) {
+    const doc = await this.kbService.getDocumentById(id);
+
+    if (!doc?.storageKey) {
+      throw new BadRequestException('Document has no storageKey');
+    }
+
+    const { stream, contentType, contentLength } =
+      await this.fileStorage.getFileStream(doc.storageKey);
+
+    const original = doc.originalName || doc.title || 'document';
+    const safeAsciiFallback = 'document';
+
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${safeAsciiFallback}"; filename*=UTF-8''${encodeRFC5987(
+        original,
+      )}`,
+    );
+
+    res.setHeader(
+      'Content-Type',
+      contentType || doc.mimeType || 'application/octet-stream',
+    );
+
+    if (typeof contentLength === 'number') {
+      res.setHeader('Content-Length', String(contentLength));
+    }
+
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).send('Failed to download file');
+      } else {
+        res.end();
+      }
+    });
+
+    return stream.pipe(res);
+  }
+
+  // POST /knowledge-base/documents (JSON-only)
   @Post('documents')
   async createDocument(@Body() body: CreateDocumentDto) {
     const doc = await this.kbService.createDocument({
@@ -87,7 +147,7 @@ export class KnowledgeBaseController {
     return { document: doc };
   }
 
-  // ✅ Upload файлу + метадані через multipart/form-data
+  // ✅ Upload: POST /knowledge-base/upload
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
   async uploadDocument(
@@ -111,20 +171,24 @@ export class KnowledgeBaseController {
           .filter(Boolean)
       : [];
 
-    // 1️⃣ Заливаємо файл у S3
-    const storageKey = await this.fileStorage.uploadFile(file, {
-      organizationId: body.organizationId,
-    });
+    // ✅ Фікс крякозябр
+    const originalName = normalizeMulterFilename(file.originalname);
 
-    // 2️⃣ Створюємо запис у БД з цим ключем
+    // 1) S3 upload
+    const storageKey = await this.fileStorage.uploadFile(
+      { ...file, originalname: originalName } as any,
+      { organizationId: body.organizationId },
+    );
+
+    // 2) DB record
     const doc = await this.kbService.createDocument({
       organizationId: body.organizationId,
       createdById: body.createdById,
-      title: body.title || file.originalname,
-      originalName: file.originalname,
+      title: body.title || originalName,
+      originalName,
       mimeType: file.mimetype,
       sizeBytes: file.size,
-      storageKey, // 👈 тепер це ключ у S3
+      storageKey,
       description: body.description,
       language: body.language,
       tags,
@@ -133,7 +197,6 @@ export class KnowledgeBaseController {
     return { document: doc };
   }
 
-  // ✅ Пошук по базі знань
   // GET /knowledge-base/search?organizationId=...&q=...&limit=10
   @Get('search')
   async search(

@@ -4,6 +4,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { AiService } from '../ai/ai.service';
 
+import * as mammoth from 'mammoth';
+import * as XLSX from 'xlsx';
+
+// PDF.js – стабільний варіант
+import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+
 type CreateDocumentInput = {
   organizationId: string;
   createdById: string;
@@ -19,6 +25,33 @@ type CreateDocumentInput = {
   tags?: string[];
 };
 
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  const loadingTask = (pdfjs as any).getDocument({
+    data: new Uint8Array(buffer),
+    disableWorker: true,
+  });
+
+  const pdf = await loadingTask.promise;
+
+  const pages: string[] = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+
+    const pageText = (content.items as any[])
+      .map((it) => (typeof it?.str === 'string' ? it.str : ''))
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (pageText) pages.push(pageText);
+  }
+
+  return pages.join('\n\n');
+}
+
 @Injectable()
 export class KnowledgeBaseService {
   private readonly enableEmbeddings: boolean;
@@ -33,7 +66,7 @@ export class KnowledgeBaseService {
     console.log('[KB] embeddings enabled:', this.enableEmbeddings);
   }
 
-  // ---------- ПУБЛІЧНІ МЕТОДИ ДЛЯ CONTROLLER ----------
+  // ---------- PUBLIC ----------
 
   async listDocumentsForOrganization(organizationId: string) {
     return this.prisma.document.findMany({
@@ -55,13 +88,7 @@ export class KnowledgeBaseService {
     return doc;
   }
 
-  /**
-   * Створення документа + запуск обробки файлу (chunking + embeddings).
-   * Викликається як з JSON endpoint, так і з upload endpoint.
-   */
   async createDocument(input: CreateDocumentInput) {
-    console.log('[KB] createDocument start', input.originalName);
-
     const doc = await this.prisma.document.create({
       data: {
         organizationId: input.organizationId,
@@ -78,17 +105,9 @@ export class KnowledgeBaseService {
       },
     });
 
-    console.log('[KB] created doc', doc.id);
-
-    this.processDocumentFile(doc)
-      .then(() => {
-        console.log('[KB] processDocumentFile finished', doc.id);
-      })
-      .catch((err) => {
-        console.error('[KB] processDocumentFile error', doc.id, err);
-      });
-
-    console.log('[KB] createDocument return', doc.id);
+    this.processDocumentFile(doc).catch((err) =>
+      console.error('[KB] processDocumentFile error', doc.id, err),
+    );
 
     return doc;
   }
@@ -105,96 +124,67 @@ export class KnowledgeBaseService {
     return { success: true };
   }
 
-  /**
-   * Пошук по базі знань (fallback варіант, якщо не хочеш RAG у чаті).
-   */
   async searchInOrganization(
     organizationId: string,
     query: string,
     limit = 10,
   ) {
-    if (!query.trim()) {
-      return [];
-    }
+    if (!query.trim()) return [];
 
-    const chunks = await this.prisma.documentChunk.findMany({
+    return this.prisma.documentChunk.findMany({
       where: {
         document: { organizationId },
-        content: {
-          contains: query,
-          mode: 'insensitive',
-        },
+        content: { contains: query, mode: 'insensitive' },
       },
-      include: {
-        document: true,
-      },
+      include: { document: true },
       take: limit,
-      orderBy: {
-        createdAt: 'desc',
-      },
+      orderBy: { createdAt: 'desc' },
     });
-
-    return chunks;
   }
 
-  // ---------- ВНУТРІШНЯ ОБРОБКА ФАЙЛУ (chunking + embeddings) ----------
+  // ---------- PROCESSING ----------
 
   private async processDocumentFile(doc: Document) {
-    console.log('[KB] processDocumentFile START', doc.id, doc.originalName);
-
     try {
-      // 1) читаємо файл з S3
       const buffer = await this.fileStorage.getFile(doc.storageKey);
-      let text = buffer.toString('utf-8');
 
-      text = text.trim();
-      console.log('[KB] processDocumentFile text length', text.length);
+      const text = (
+        await this.extractText(buffer, doc.mimeType, doc.originalName)
+      ).trim();
 
       if (!text) {
-        await this.markDocumentFailed(doc.id, 'Empty content');
+        await this.markDocumentFailed(
+          doc.id,
+          'Empty content (PDF may be scan)',
+        );
         return;
       }
 
-      // 2) ріжемо на чанки ~1000 символів
       const chunks = this.splitTextIntoChunks(text, 1000);
-      console.log('[KB] processDocumentFile chunks count', chunks.length);
 
-      // 3) генеруємо embeddings (якщо увімкнено)
       let embeddings: number[][] = [];
-      if (this.enableEmbeddings && chunks.length > 0) {
+      if (this.enableEmbeddings && chunks.length) {
         try {
-          console.log('[KB] creating embeddings for', chunks.length, 'chunks');
           embeddings = await this.ai.createEmbeddings(chunks);
-          console.log('[KB] embeddings created, count', embeddings.length);
-        } catch (err) {
-          console.error(
-            `Failed to create embeddings for document ${doc.id}`,
-            err,
-          );
+        } catch {
           embeddings = [];
         }
       }
 
-      // 4) записуємо чанки + оновлюємо документ в одній транзакції
       await this.prisma.$transaction(async (tx) => {
         await tx.documentChunk.deleteMany({
           where: { documentId: doc.id },
         });
 
-        const createData = chunks.map((chunk, index) => ({
-          documentId: doc.id,
-          chunkIndex: index,
-          content: chunk,
-          tokenCount: this.estimateTokenCount(chunk),
-          embedding:
-            embeddings[index] && embeddings[index].length
-              ? (embeddings[index] as unknown as number[])
-              : [],
-        }));
-
-        if (createData.length > 0) {
+        if (chunks.length) {
           await tx.documentChunk.createMany({
-            data: createData,
+            data: chunks.map((chunk, i) => ({
+              documentId: doc.id,
+              chunkIndex: i,
+              content: chunk,
+              tokenCount: this.estimateTokenCount(chunk),
+              embedding: embeddings[i] ?? [],
+            })),
           });
         }
 
@@ -202,81 +192,92 @@ export class KnowledgeBaseService {
           where: { id: doc.id },
           data: {
             status: DocumentStatus.READY,
-            chunkCount: createData.length,
+            chunkCount: chunks.length,
           },
         });
       });
-
-      console.log('[KB] processDocumentFile DONE tx', doc.id);
-    } catch (err) {
-      console.error('[KB] Error processing document file', doc.id, err);
-      await this.markDocumentFailed(doc.id, 'Processing error');
+    } catch (err: any) {
+      await this.markDocumentFailed(
+        doc.id,
+        `Processing error: ${err?.message || 'unknown'}`,
+      );
     }
   }
 
-  private async markDocumentFailed(id: string, reason: string) {
-    console.log('[KB] markDocumentFailed', id, reason);
+  private async extractText(
+    buffer: Buffer,
+    mimeType?: string | null,
+    originalName?: string | null,
+  ): Promise<string> {
+    const mt = (mimeType || '').toLowerCase();
+    const name = (originalName || '').toLowerCase();
 
+    // PDF
+    if (mt.includes('pdf') || name.endsWith('.pdf')) {
+      return extractPdfText(buffer);
+    }
+
+    // DOCX
+    if (mt.includes('word') || name.endsWith('.docx')) {
+      const res = await mammoth.extractRawText({ buffer });
+      return res.value || '';
+    }
+
+    // XLSX / XLS
+    if (
+      mt.includes('excel') ||
+      name.endsWith('.xlsx') ||
+      name.endsWith('.xls')
+    ) {
+      const wb = XLSX.read(buffer, { type: 'buffer' });
+      const parts: string[] = [];
+
+      for (const sheetName of wb.SheetNames) {
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {
+          header: 1,
+        });
+
+        for (const r of rows) {
+          if (Array.isArray(r)) {
+            const line = r.map(String).join(' ').trim();
+            if (line) parts.push(line);
+          }
+        }
+      }
+
+      return parts.join('\n');
+    }
+
+    // TXT
+    return buffer.toString('utf-8');
+  }
+
+  private async markDocumentFailed(id: string, reason: string) {
     const doc = await this.prisma.document.findUnique({
       where: { id },
       select: { description: true },
     });
 
-    const prev = doc?.description ?? '';
-    const suffix = `[KB ERROR: ${reason}]`;
-
     await this.prisma.document.update({
       where: { id },
       data: {
         status: DocumentStatus.FAILED,
-        description: prev ? `${prev} ${suffix}` : suffix,
+        description: doc?.description
+          ? `${doc.description} [KB ERROR: ${reason}]`
+          : `[KB ERROR: ${reason}]`,
       },
     });
   }
 
-  private splitTextIntoChunks(text: string, chunkSize: number): string[] {
-    const chunks: string[] = [];
-    const len = text.length;
-    let current = 0;
-
-    while (current < len) {
-      // Початково беремо шматок фіксованого розміру
-      let next = Math.min(len, current + chunkSize);
-      const slice = text.slice(current, next);
-
-      // Шукаємо "гарне" місце для розрізу всередині slice
-      let cut =
-        slice.lastIndexOf('. ') !== -1
-          ? slice.lastIndexOf('. ')
-          : slice.lastIndexOf('\n') !== -1
-            ? slice.lastIndexOf('\n')
-            : slice.lastIndexOf(' ');
-
-      // Якщо нічого не знайшли або cut занадто близько до початку —
-      // просто ріжемо по chunkSize (щоб не зациклитись)
-      if (cut <= 0) {
-        cut = slice.length;
-      }
-
-      next = current + cut;
-      if (next <= current) {
-        // страховка від будь-яких дивних кейсів
-        next = Math.min(len, current + chunkSize);
-      }
-
-      const piece = text.slice(current, next).trim();
-      if (piece) {
-        chunks.push(piece);
-      }
-
-      current = next;
+  private splitTextIntoChunks(text: string, size: number) {
+    const out: string[] = [];
+    for (let i = 0; i < text.length; i += size) {
+      out.push(text.slice(i, i + size));
     }
-
-    return chunks;
+    return out;
   }
 
-  private estimateTokenCount(text: string): number {
-    // дуже груба оцінка: слова ≈ токени
+  private estimateTokenCount(text: string) {
     return text.split(/\s+/).filter(Boolean).length;
   }
 }
