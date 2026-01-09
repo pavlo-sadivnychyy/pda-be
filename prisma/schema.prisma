@@ -56,6 +56,12 @@ enum TodoPriority {
   HIGH
 }
 
+enum PlanId {
+  FREE
+  BASIC
+  PRO
+}
+
 // Інвойси
 
 enum InvoiceStatus {
@@ -89,8 +95,8 @@ model User {
   lastName            String?
   fullName            String?
   avatarUrl           String?
-  locale              String? // "uk-UA"
-  timezone            String? // "Europe/Kyiv"
+  locale              String?
+  timezone            String?
   jobTitle            String?
   phone               String?
   onboardingCompleted Boolean   @default(false)
@@ -98,10 +104,10 @@ model User {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  // членство в організаціях (через UserOrganization)
-  organizations UserOrganization[]
+  // ✅ 1:1 subscription (може бути null поки не створили)
+  subscription Subscription?
 
-  // юзер може бути власником тільки ОДНІЄЇ організації
+  organizations UserOrganization[]
   ownedOrganization Organization? @relation("OwnerOrganizations")
 
   documents    Document[]
@@ -110,7 +116,6 @@ model User {
   todoTasks      TodoTask[]
   todoDailyPlans TodoDailyPlan[]
 
-  // фінансові сутності
   clients  Client[]
   invoices Invoice[]
   acts     Act[]
@@ -150,7 +155,6 @@ model Organization {
 
   members         UserOrganization[]
   businessProfile BusinessProfile?
-  subscriptions   Subscription[]
   documents       Document[]
   chatSessions    ChatSession[]
 
@@ -202,46 +206,25 @@ model BusinessProfile {
 
 // ---- SubscriptionPlan / Subscription ----
 
-model SubscriptionPlan {
-  id                     String   @id @default(cuid())
-  name                   String
-  slug                   String   @unique
-  description            String?
-  stripeProductId        String?
-  stripePriceIdMonthly   String?
-  stripePriceIdYearly    String?
-  monthlyAiTokensLimit   Int?
-  monthlyAiRequestsLimit Int?
-  maxUsersPerOrg         Int?
-  storageLimitMb         Int?
-  maxDocuments           Int?
-  maxChatSessions        Int?
-  isDefault              Boolean  @default(false)
-  isPublic               Boolean  @default(true)
-  sortOrder              Int      @default(0)
-  createdAt              DateTime @default(now())
-  updatedAt              DateTime @updatedAt
-
-  subscriptions Subscription[]
-}
-
 model Subscription {
-  id                   String    @id @default(cuid())
-  organizationId       String
-  planId               String
+  id                   String   @id @default(cuid())
+
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id])
+
+  planId               PlanId   @default(FREE) // ✅ дефолт FREE
+
   stripeCustomerId     String?
   stripeSubscriptionId String?
-  status               String // "trialing" | "active" | ...
+  status               String   @default("active")
   trialStart           DateTime?
   trialEnd             DateTime?
   currentPeriodStart   DateTime?
   currentPeriodEnd     DateTime?
-  cancelAtPeriodEnd    Boolean   @default(false)
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
+  cancelAtPeriodEnd    Boolean  @default(false)
 
-  organization Organization     @relation(fields: [organizationId], references: [id])
-  plan         SubscriptionPlan @relation(fields: [planId], references: [id])
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 }
 
 // ---- Documents ----
