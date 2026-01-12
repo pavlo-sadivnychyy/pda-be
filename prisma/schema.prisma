@@ -260,6 +260,9 @@ model Document {
   // pdf-документ для інвойсу
   invoice Invoice? @relation("InvoiceDocument")
 
+  // ✅ pdf-документ для інвойсу (International)
+  invoiceInternational Invoice? @relation("InvoiceInternationalDocument")
+
   // pdf-документ для акта
   act Act? @relation("ActDocument")
 }
@@ -344,7 +347,7 @@ model Client {
 model Invoice {
   id             String  @id @default(cuid())
   organizationId String
-  clientId       String? // може бути null, якщо інвойс без клієнта
+  clientId       String?
   createdById    String
 
   number    String    @unique
@@ -362,8 +365,13 @@ model Invoice {
   sentAt DateTime?
   paidAt DateTime?
 
+  // ===== PDF UA =====
   pdfDocumentId String?   @unique
   pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
+
+  // ✅ ===== PDF International =====
+  internationalPdfDocumentId String?   @unique
+  internationalPdfDocument   Document? @relation("InvoiceInternationalDocument", fields: [internationalPdfDocumentId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

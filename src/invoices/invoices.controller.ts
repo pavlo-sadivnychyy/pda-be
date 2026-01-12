@@ -22,6 +22,7 @@ export class InvoicesController {
   private readonly s3 = new S3Client({
     region: process.env.S3_REGION || 'eu-central-1',
   });
+
   constructor(
     private readonly invoicesService: InvoicesService,
     private readonly invoicePdfService: InvoicePdfService,
@@ -42,14 +43,12 @@ export class InvoicesController {
     return { analytics };
   }
 
-  // POST /invoices
   @Post()
   async create(@Body() dto: CreateInvoiceDto) {
     const invoice = await this.invoicesService.create(dto);
     return { invoice };
   }
 
-  // GET /invoices?organizationId=...&status=PAID&clientId=...
   @Get()
   async findAll(
     @Query('organizationId') organizationId: string,
@@ -65,58 +64,62 @@ export class InvoicesController {
     return { invoices };
   }
 
-  // GET /invoices/:id
   @Get(':id')
   async findOne(@Param('id') id: string) {
     const invoice = await this.invoicesService.findOne(id);
     return { invoice };
   }
 
-  // PATCH /invoices/:id
   @Patch(':id')
   async update(@Param('id') id: string, @Body() dto: UpdateInvoiceDto) {
     const invoice = await this.invoicesService.update(id, dto);
     return { invoice };
   }
 
-  // DELETE /invoices/:id
   @Delete(':id')
   async remove(@Param('id') id: string) {
     const result = await this.invoicesService.remove(id);
     return { success: true, deleted: result };
   }
 
-  // ===== ЖИТТЄВИЙ ЦИКЛ =====
-
-  // POST /invoices/:id/send
   @Post(':id/send')
   async send(@Param('id') id: string) {
     const invoice = await this.invoicesService.send(id);
     return { invoice };
   }
 
-  // POST /invoices/:id/mark-paid
   @Post(':id/mark-paid')
   async markPaid(@Param('id') id: string, @Body() dto: MarkInvoicePaidDto) {
     const invoice = await this.invoicesService.markPaid(id, dto);
     return { invoice };
   }
 
-  // POST /invoices/:id/cancel
   @Post(':id/cancel')
   async cancel(@Param('id') id: string) {
     const invoice = await this.invoicesService.cancel(id);
     return { invoice };
   }
 
-  // ===== PDF =====
-
-  // GET /invoices/:id/pdf
-  // Якщо PDF ще немає — згенерує; потім віддасть файл.
+  // ===== PDF UA (як було) =====
   @Get(':id/pdf')
   async getPdf(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
-      await this.invoicePdfService.getOrCreatePdfForInvoice(id);
+      await this.invoicePdfService.getOrCreatePdfForInvoiceUa(id);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${document.originalName}"`,
+    );
+
+    res.end(pdfBuffer);
+  }
+
+  // ✅ ===== PDF International (новий) =====
+  @Get(':id/pdf-international')
+  async getPdfInternational(@Param('id') id: string, @Res() res: any) {
+    const { document, pdfBuffer } =
+      await this.invoicePdfService.getOrCreatePdfForInvoiceInternational(id);
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
