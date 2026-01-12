@@ -62,6 +62,16 @@ enum PlanId {
   PRO
 }
 
+enum QuoteStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+}
+
+
 // Інвойси
 
 enum InvoiceStatus {
@@ -119,6 +129,7 @@ model User {
   clients  Client[]
   invoices Invoice[]
   acts     Act[]
+  quotes   Quote[]
 }
 
 // ---- Organization ----
@@ -172,6 +183,7 @@ model Organization {
   clients  Client[]
   invoices Invoice[]
   acts     Act[]
+  quotes   Quote[]
 }
 
 
@@ -240,6 +252,65 @@ model Subscription {
 
 // ---- Documents ----
 
+model Quote {
+  id             String   @id @default(cuid())
+  organizationId String
+  clientId       String?
+  createdById    String
+
+  number     String   @unique
+  issueDate  DateTime @default(now())
+  validUntil DateTime?
+
+  currency String @default("USD")
+  status   QuoteStatus @default(DRAFT)
+
+  subtotal  Decimal  @db.Decimal(18, 2)
+  taxAmount Decimal? @db.Decimal(18, 2)
+  total     Decimal  @db.Decimal(18, 2)
+
+  notes String?
+
+  // ✅ NEW: коли реально відправили клієнту
+  sentAt DateTime?
+
+  // ✅ (опціонально, корисно для дебагу)
+  lastEmailedTo  String?
+  emailMessageId String?
+
+  convertedInvoiceId String?  @unique
+  convertedInvoice   Invoice? @relation(fields: [convertedInvoiceId], references: [id])
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  client       Client?      @relation(fields: [clientId], references: [id])
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  items QuoteItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  pdfDocumentId String?   @unique
+  pdfDocument   Document? @relation("QuoteDocument", fields: [pdfDocumentId], references: [id])
+
+}
+
+
+model QuoteItem {
+  id      String @id @default(cuid())
+  quoteId String
+
+  name        String
+  description String?
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(18, 2)
+  taxRate     Decimal? @db.Decimal(5, 2)
+  lineTotal   Decimal  @db.Decimal(18, 2)
+
+  quote Quote @relation(fields: [quoteId], references: [id])
+
+  @@index([quoteId])
+}
+
 model Document {
   id             String @id @default(cuid())
   organizationId String
@@ -276,6 +347,7 @@ model Document {
 
   // pdf-документ для акта
   act Act? @relation("ActDocument")
+  quote   Quote?   @relation("QuoteDocument")
 }
 
 model DocumentChunk {
@@ -351,6 +423,7 @@ model Client {
 
   invoices Invoice[]
   acts     Act[]
+  quotes   Quote[]
 }
 
 // ---- Invoices ----
@@ -393,6 +466,7 @@ model Invoice {
 
   items InvoiceItem[]
   acts  Act[]
+  convertedFromQuote Quote?
 }
 
 

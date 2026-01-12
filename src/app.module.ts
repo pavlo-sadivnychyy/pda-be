@@ -11,6 +11,7 @@ import { TodoModule } from './todo/todo.module';
 import { InvoicesModule } from './invoices/invoices.module';
 import { ClientsModule } from './clients/clients.module';
 import { ActsModule } from './acts/acts.module';
+import { QuotesModule } from './quotes/quotes.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { ActsModule } from './acts/acts.module';
     ChatModule,
     ClientsModule,
     ActsModule,
+    QuotesModule,
     InvoicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
   ],
