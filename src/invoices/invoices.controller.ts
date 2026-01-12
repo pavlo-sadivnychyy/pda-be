@@ -15,14 +15,9 @@ import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus } from '@prisma/client';
 import { InvoicePdfService } from './invoice-pdf.service';
-import { S3Client } from '@aws-sdk/client-s3';
 
 @Controller('invoices')
 export class InvoicesController {
-  private readonly s3 = new S3Client({
-    region: process.env.S3_REGION || 'eu-central-1',
-  });
-
   constructor(
     private readonly invoicesService: InvoicesService,
     private readonly invoicePdfService: InvoicePdfService,
@@ -100,9 +95,9 @@ export class InvoicesController {
     return { invoice };
   }
 
-  // ===== PDF UA (як було) =====
+  // ===== PDF UA =====
   @Get(':id/pdf')
-  async getPdf(@Param('id') id: string, @Res() res: any) {
+  async getPdfUa(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
       await this.invoicePdfService.getOrCreatePdfForInvoiceUa(id);
 
@@ -111,11 +106,10 @@ export class InvoicesController {
       'Content-Disposition',
       `inline; filename="${document.originalName}"`,
     );
-
     res.end(pdfBuffer);
   }
 
-  // ✅ ===== PDF International (новий) =====
+  // ===== PDF INTERNATIONAL =====
   @Get(':id/pdf-international')
   async getPdfInternational(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
@@ -126,7 +120,6 @@ export class InvoicesController {
       'Content-Disposition',
       `inline; filename="${document.originalName}"`,
     );
-
     res.end(pdfBuffer);
   }
 }

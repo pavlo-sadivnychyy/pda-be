@@ -141,12 +141,23 @@ model Organization {
   primaryContactPhone String?
 
   // Нові поля бізнес-профілю організації
-  businessNiche       String? // Ніша бізнесу
-  servicesDescription String? // Опис послуг
-  targetAudience      String? // Цільова аудиторія
-  brandStyle          String? // Брендовий стиль
+  businessNiche       String?
+  servicesDescription String?
+  targetAudience      String?
+  brandStyle          String?
 
-  // Один юзер може бути власником тільки однієї організації
+  // ✅ International payment details (NEW)
+  legalName            String?
+  legalAddress         String?
+  vatId                String?
+  registrationNumber   String?
+  iban                 String?
+  swiftBic             String?
+  bankName             String?
+  bankAddress          String?
+  beneficiaryName      String?
+  paymentReferenceHint String?
+
   ownerId String @unique
   owner   User   @relation("OwnerOrganizations", fields: [ownerId], references: [id])
 
@@ -158,11 +169,11 @@ model Organization {
   documents       Document[]
   chatSessions    ChatSession[]
 
-  // фінансові сутності
   clients  Client[]
   invoices Invoice[]
   acts     Act[]
 }
+
 
 // ---- UserOrganization ----
 
@@ -347,7 +358,7 @@ model Client {
 model Invoice {
   id             String  @id @default(cuid())
   organizationId String
-  clientId       String?
+  clientId       String? // може бути null, якщо інвойс без клієнта
   createdById    String
 
   number    String    @unique
@@ -365,13 +376,13 @@ model Invoice {
   sentAt DateTime?
   paidAt DateTime?
 
-  // ===== PDF UA =====
+  // UA PDF
   pdfDocumentId String?   @unique
   pdfDocument   Document? @relation("InvoiceDocument", fields: [pdfDocumentId], references: [id])
 
-  // ✅ ===== PDF International =====
-  internationalPdfDocumentId String?   @unique
-  internationalPdfDocument   Document? @relation("InvoiceInternationalDocument", fields: [internationalPdfDocumentId], references: [id])
+  // ✅ International PDF (окремий документ, щоб не перетирав UA)
+  pdfInternationalDocumentId String?   @unique
+  pdfInternationalDocument   Document? @relation("InvoiceInternationalDocument", fields: [pdfInternationalDocumentId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -383,6 +394,7 @@ model Invoice {
   items InvoiceItem[]
   acts  Act[]
 }
+
 
 model InvoiceItem {
   id        String @id @default(cuid())

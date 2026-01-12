@@ -23,7 +23,7 @@ export class InvoicePdfService {
     }
     // Prisma.Decimal
     // @ts-ignore
-    if (typeof value.toNumber === 'function') {
+    if (value && typeof value.toNumber === 'function') {
       // @ts-ignore
       const num = value.toNumber();
       return num.toFixed(2);
@@ -31,8 +31,16 @@ export class InvoicePdfService {
     return String(value);
   }
 
-  // ===== UA PDF (твій поточний) =====
-  private async buildUaPdfBuffer(invoice: any): Promise<Buffer> {
+  private formatIban(iban?: string | null): string {
+    const s = (iban ?? '').replace(/\s+/g, '').trim();
+    if (!s) return '';
+    return s.replace(/(.{4})/g, '$1 ').trim();
+  }
+
+  // ===========================
+  // ===== UA PDF TEMPLATE =====
+  // ===========================
+  private async buildPdfBufferUa(invoice: any): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
       const doc = new PDFDocument({ margin: 50 });
 
@@ -46,43 +54,39 @@ export class InvoicePdfService {
         fontsRoot,
         'Inter-VariableFont_opsz,wght.ttf',
       );
-
       doc.registerFont('Body', interVariablePath);
       doc.registerFont('BodyBold', interVariablePath);
 
       doc
         .font('BodyBold')
         .fontSize(20)
-        .text(invoice.organization.name || 'Invoice', { align: 'left' });
+        .text(invoice.organization?.name || 'Invoice', { align: 'left' });
 
       doc.moveDown(0.5);
 
       doc.font('Body').fontSize(10);
-      if (invoice.organization.industry) {
+      if (invoice.organization?.industry)
         doc.text(invoice.organization.industry);
-      }
-      const orgLines: string[] = [];
 
-      if (invoice.organization.country || invoice.organization.city) {
+      const orgLines: string[] = [];
+      if (invoice.organization?.country || invoice.organization?.city) {
         orgLines.push(
           [invoice.organization.country, invoice.organization.city]
             .filter(Boolean)
             .join(', '),
         );
       }
-      if (invoice.organization.websiteUrl) {
+      if (invoice.organization?.websiteUrl)
         orgLines.push(invoice.organization.websiteUrl);
-      }
-      if (invoice.organization.primaryContactEmail) {
+      if (invoice.organization?.primaryContactEmail) {
         orgLines.push(`Email: ${invoice.organization.primaryContactEmail}`);
       }
-      if (invoice.organization.primaryContactPhone) {
+      if (invoice.organization?.primaryContactPhone) {
         orgLines.push(`Тел: ${invoice.organization.primaryContactPhone}`);
       }
+      orgLines.forEach((l) => doc.text(l));
 
-      orgLines.forEach((line) => doc.text(line));
-
-      const issueDate = invoice.issueDate.toISOString().slice(0, 10);
+      const issueDate = invoice.issueDate?.toISOString().slice(0, 10) ?? '-';
       const dueDate = invoice.dueDate
         ? invoice.dueDate.toISOString().slice(0, 10)
         : '-';
@@ -97,25 +101,16 @@ export class InvoicePdfService {
       doc.moveDown(1.5);
 
       doc.font('BodyBold').fontSize(12).text('Клієнт', { underline: true });
-
       doc.font('Body').fontSize(10);
+
       if (invoice.client) {
-        doc.text(invoice.client.name);
-        if (invoice.client.contactName) {
-          doc.text(`Контактна особа: ${invoice.client.contactName}`);
-        }
-        if (invoice.client.email) {
-          doc.text(`Email: ${invoice.client.email}`);
-        }
-        if (invoice.client.phone) {
-          doc.text(`Телефон: ${invoice.client.phone}`);
-        }
-        if (invoice.client.taxNumber) {
-          doc.text(`Податковий номер: ${invoice.client.taxNumber}`);
-        }
-        if (invoice.client.address) {
-          doc.text(`Адреса: ${invoice.client.address}`);
-        }
+        const c = invoice.client;
+        doc.text(c.name || '—');
+        if (c.contactName) doc.text(`Контактна особа: ${c.contactName}`);
+        if (c.email) doc.text(`Email: ${c.email}`);
+        if (c.phone) doc.text(`Телефон: ${c.phone}`);
+        if (c.taxNumber) doc.text(`Податковий номер: ${c.taxNumber}`);
+        if (c.address) doc.text(`Адреса: ${c.address}`);
       } else {
         doc.text('—');
       }
@@ -123,19 +118,13 @@ export class InvoicePdfService {
       doc.moveDown(1.5);
 
       const tableTop = doc.y;
-      const colX = {
-        name: 50,
-        qty: 280,
-        price: 330,
-        tax: 400,
-        total: 470,
-      };
+      const colX = { name: 50, qty: 280, price: 330, tax: 400, total: 470 };
 
       doc.font('BodyBold').fontSize(10).text('Позиція', colX.name, tableTop);
-      doc.font('BodyBold').text('К-сть', colX.qty, tableTop);
-      doc.font('BodyBold').text('Ціна', colX.price, tableTop);
-      doc.font('BodyBold').text('ПДВ, %', colX.tax, tableTop);
-      doc.font('BodyBold').text('Сума', colX.total, tableTop);
+      doc.text('К-сть', colX.qty, tableTop);
+      doc.text('Ціна', colX.price, tableTop);
+      doc.text('ПДВ, %', colX.tax, tableTop);
+      doc.text('Сума', colX.total, tableTop);
 
       doc
         .moveTo(50, tableTop + 14)
@@ -143,20 +132,20 @@ export class InvoicePdfService {
         .stroke();
 
       let y = tableTop + 20;
-
       const rowHeight = 18;
       const maxY = 750;
 
-      invoice.items.forEach((item: any) => {
+      for (const item of invoice.items ?? []) {
         if (y > maxY) {
           doc.addPage();
           y = 50;
 
           doc.font('BodyBold').fontSize(10).text('Позиція', colX.name, y);
-          doc.font('BodyBold').text('К-сть', colX.qty, y);
-          doc.font('BodyBold').text('Ціна', colX.price, y);
-          doc.font('BodyBold').text('ПДВ, %', colX.tax, y);
-          doc.font('BodyBold').text('Сума', colX.total, y);
+          doc.text('К-сть', colX.qty, y);
+          doc.text('Ціна', colX.price, y);
+          doc.text('ПДВ, %', colX.tax, y);
+          doc.text('Сума', colX.total, y);
+
           doc
             .moveTo(50, y + 14)
             .lineTo(550, y + 14)
@@ -165,18 +154,16 @@ export class InvoicePdfService {
         }
 
         const taxRateStr =
-          item.taxRate != null
-            ? `${item.taxRate.toString().replace('.', ',')}`
-            : '-';
+          item.taxRate != null ? String(item.taxRate).replace('.', ',') : '-';
 
         doc
           .font('Body')
           .fontSize(10)
-          .text(item.name, colX.name, y, {
+          .text(item.name ?? '—', colX.name, y, {
             width: colX.qty - colX.name - 10,
           });
 
-        doc.text(item.quantity.toString(), colX.qty, y);
+        doc.text(String(item.quantity ?? 0), colX.qty, y);
         doc.text(
           `${this.formatMoney(item.unitPrice)} ${invoice.currency}`,
           colX.price,
@@ -203,7 +190,7 @@ export class InvoicePdfService {
 
           y += rowHeight;
         }
-      });
+      }
 
       doc.moveDown(2);
 
@@ -217,15 +204,11 @@ export class InvoicePdfService {
         .text(`Сума без ПДВ: ${subtotalStr} ${invoice.currency}`, {
           align: 'right',
         });
-      doc
-        .font('Body')
-        .text(`ПДВ: ${taxAmountStr} ${invoice.currency}`, { align: 'right' });
+      doc.text(`ПДВ: ${taxAmountStr} ${invoice.currency}`, { align: 'right' });
       doc
         .font('BodyBold')
         .fontSize(12)
-        .text(`До оплати: ${totalStr} ${invoice.currency}`, {
-          align: 'right',
-        });
+        .text(`До оплати: ${totalStr} ${invoice.currency}`, { align: 'right' });
 
       doc.moveDown(2);
 
@@ -244,8 +227,10 @@ export class InvoicePdfService {
     });
   }
 
-  // ✅ INTERNATIONAL PDF (новий)
-  private async buildInternationalPdfBuffer(invoice: any): Promise<Buffer> {
+  // ===================================
+  // ===== INTERNATIONAL TEMPLATE =======
+  // ===================================
+  private async buildPdfBufferInternational(invoice: any): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
       const doc = new PDFDocument({ margin: 50 });
 
@@ -259,129 +244,154 @@ export class InvoicePdfService {
         fontsRoot,
         'Inter-VariableFont_opsz,wght.ttf',
       );
-
       doc.registerFont('Body', interVariablePath);
       doc.registerFont('BodyBold', interVariablePath);
 
-      // Header
-      doc.font('BodyBold').fontSize(22).text('INVOICE', { align: 'left' });
+      const org = invoice.organization ?? {};
 
-      doc.moveDown(0.5);
+      const left = doc.page.margins.left;
+      const right = doc.page.margins.right;
+      const usableWidth = doc.page.width - left - right;
 
-      // Seller (Organization)
-      doc.font('BodyBold').fontSize(11).text('Seller', { underline: true });
-      doc.font('Body').fontSize(10);
+      doc.font('BodyBold').fontSize(28).text('INVOICE', { align: 'left' });
+      doc.moveDown(0.8);
 
-      const org = invoice.organization;
+      // ===== Seller (left column)
+      const sellerX = left;
+      const sellerY = doc.y;
+
+      doc
+        .font('BodyBold')
+        .fontSize(11)
+        .text('Seller', sellerX, sellerY, { underline: true });
+      doc.moveDown(0.3);
+      doc.font('Body').fontSize(11);
+
       const sellerLines: string[] = [];
-
       sellerLines.push(org.name || '—');
-
-      const sellerLocation = [org.city, org.country].filter(Boolean).join(', ');
-      if (sellerLocation) sellerLines.push(sellerLocation);
-
+      if (org.city || org.country) {
+        sellerLines.push([org.city, org.country].filter(Boolean).join(', '));
+      }
       if (org.websiteUrl) sellerLines.push(org.websiteUrl);
       if (org.primaryContactEmail)
         sellerLines.push(`Email: ${org.primaryContactEmail}`);
-      if (org.primaryContactPhone)
-        sellerLines.push(`Phone: ${org.primaryContactPhone}`);
+      sellerLines.forEach((l) => doc.text(l, sellerX));
 
-      sellerLines.forEach((l) => doc.text(l));
+      const sellerEndY = doc.y;
 
-      // Invoice info (right)
-      const issueDate = invoice.issueDate.toISOString().slice(0, 10);
+      // ===== Right block (invoice meta) — IMPORTANT: do NOT use x=0
+      const issueDate = invoice.issueDate
+        ? invoice.issueDate.toISOString().slice(0, 10)
+        : '-';
       const dueDate = invoice.dueDate
         ? invoice.dueDate.toISOString().slice(0, 10)
         : '-';
 
-      doc
-        .font('Body')
-        .fontSize(11)
-        .text(`Invoice No: ${invoice.number}`, { align: 'right' })
-        .text(`Issue Date: ${issueDate}`, { align: 'right' })
-        .text(`Due Date: ${dueDate}`, { align: 'right' })
-        .text(`Currency: ${invoice.currency}`, { align: 'right' });
+      const rightText = [
+        `Invoice No: ${invoice.number}`,
+        `Issue Date: ${issueDate}`,
+        `Due Date: ${dueDate}`,
+        `Currency: ${invoice.currency ?? '—'}`,
+      ].join('\n');
 
-      doc.moveDown(1);
+      doc.font('Body').fontSize(12);
+      doc.text(rightText, left, sellerY + 2, {
+        width: usableWidth,
+        align: 'right',
+      });
 
-      // Buyer
+      const rightEndY =
+        sellerY +
+        2 +
+        doc.heightOfString(rightText, { width: usableWidth, align: 'right' });
+
+      // ✅ Reset cursor to normal left margin so Buyer won't "shift"
+      doc.x = left;
+      doc.y = Math.max(sellerEndY, rightEndY) + 18;
+
+      // ===== Buyer
       doc.font('BodyBold').fontSize(11).text('Buyer', { underline: true });
-      doc.font('Body').fontSize(10);
+      doc.moveDown(0.3);
+      doc.font('Body').fontSize(11);
 
-      const client = invoice.client;
-      if (client) {
-        doc.text(client.name || '—');
-        if (client.contactName) doc.text(`Contact: ${client.contactName}`);
-        if (client.email) doc.text(`Email: ${client.email}`);
-        if (client.phone) doc.text(`Phone: ${client.phone}`);
-        if (client.taxNumber) doc.text(`Tax/VAT ID: ${client.taxNumber}`);
-        if (client.address) doc.text(`Address: ${client.address}`);
+      if (invoice.client) {
+        const c = invoice.client;
+        const buyerLines: string[] = [];
+        buyerLines.push(c.name || '—');
+        if (c.contactName) buyerLines.push(c.contactName);
+        if (c.address) buyerLines.push(c.address);
+        if (c.email) buyerLines.push(c.email);
+        if (c.phone) buyerLines.push(c.phone);
+        if (c.taxNumber) buyerLines.push(`Tax ID: ${c.taxNumber}`);
+        doc.text(buyerLines.join('\n'), left, doc.y, {
+          width: usableWidth * 0.6,
+        });
       } else {
         doc.text('—');
       }
 
       doc.moveDown(1.2);
 
-      // Items table
-      const tableTop = doc.y;
-      const colX = {
-        desc: 50,
-        qty: 300,
-        price: 360,
-        tax: 430,
-        total: 490,
+      // ===== Table
+      const tableTop = doc.y + 10;
+      const col = {
+        desc: left,
+        qty: left + Math.round(usableWidth * 0.6),
+        unit: left + Math.round(usableWidth * 0.72),
+        tax: left + Math.round(usableWidth * 0.84),
+        amt: left + Math.round(usableWidth * 0.93),
       };
 
-      doc
-        .font('BodyBold')
-        .fontSize(10)
-        .text('Description', colX.desc, tableTop);
-      doc.font('BodyBold').text('Qty', colX.qty, tableTop);
-      doc.font('BodyBold').text('Unit', colX.price, tableTop);
-      doc.font('BodyBold').text('Tax %', colX.tax, tableTop);
-      doc.font('BodyBold').text('Amount', colX.total, tableTop);
+      doc.font('BodyBold').fontSize(11);
+      doc.text('Description', col.desc, tableTop);
+      doc.text('Qty', col.qty, tableTop, { width: 40 });
+      doc.text('Unit', col.unit, tableTop, { width: 80 });
+      doc.text('Tax %', col.tax, tableTop, { width: 60 });
+      doc.text('Amount', col.amt, tableTop, { width: 80 });
 
       doc
-        .moveTo(50, tableTop + 14)
-        .lineTo(550, tableTop + 14)
+        .moveTo(left, tableTop + 18)
+        .lineTo(left + usableWidth, tableTop + 18)
         .stroke();
 
-      let y = tableTop + 20;
+      let y = tableTop + 26;
       const rowHeight = 18;
-      const maxY = 750;
+      const maxY = doc.page.height - doc.page.margins.bottom - 230;
 
-      invoice.items.forEach((item: any) => {
+      doc.font('Body').fontSize(11);
+
+      for (const item of invoice.items ?? []) {
         if (y > maxY) {
           doc.addPage();
-          y = 50;
+          doc.x = left;
+          y = doc.page.margins.top;
 
-          doc.font('BodyBold').fontSize(10).text('Description', colX.desc, y);
-          doc.font('BodyBold').text('Qty', colX.qty, y);
-          doc.font('BodyBold').text('Unit', colX.price, y);
-          doc.font('BodyBold').text('Tax %', colX.tax, y);
-          doc.font('BodyBold').text('Amount', colX.total, y);
+          doc.font('BodyBold').fontSize(11);
+          doc.text('Description', col.desc, y);
+          doc.text('Qty', col.qty, y, { width: 40 });
+          doc.text('Unit', col.unit, y, { width: 80 });
+          doc.text('Tax %', col.tax, y, { width: 60 });
+          doc.text('Amount', col.amt, y, { width: 80 });
 
           doc
-            .moveTo(50, y + 14)
-            .lineTo(550, y + 14)
+            .moveTo(left, y + 18)
+            .lineTo(left + usableWidth, y + 18)
             .stroke();
 
-          y += 20;
+          y += 26;
+          doc.font('Body').fontSize(11);
         }
 
-        const taxRateStr = item.taxRate != null ? `${item.taxRate}` : '-';
+        const taxRateStr =
+          item.taxRate != null ? String(item.taxRate).replace('.', ',') : '-';
 
-        doc
-          .font('Body')
-          .fontSize(10)
-          .text(item.name, colX.desc, y, {
-            width: colX.qty - colX.desc - 10,
-          });
-
-        doc.text(String(item.quantity), colX.qty, y);
-        doc.text(this.formatMoney(item.unitPrice), colX.price, y);
-        doc.text(taxRateStr, colX.tax, y);
-        doc.text(this.formatMoney(item.lineTotal), colX.total, y);
+        doc.text(item.name ?? '—', col.desc, y, {
+          width: col.qty - col.desc - 10,
+        });
+        doc.text(String(item.quantity ?? 0), col.qty, y, { width: 40 });
+        doc.text(this.formatMoney(item.unitPrice), col.unit, y, { width: 80 });
+        doc.text(taxRateStr, col.tax, y, { width: 60 });
+        doc.text(this.formatMoney(item.lineTotal), col.amt, y, { width: 80 });
 
         y += rowHeight;
 
@@ -390,45 +400,92 @@ export class InvoicePdfService {
             .font('Body')
             .fontSize(9)
             .fillColor('#6b7280')
-            .text(item.description, colX.desc, y, {
-              width: 520 - colX.desc,
-            })
+            .text(item.description, col.desc, y, { width: usableWidth })
             .fillColor('#000000');
+          doc.font('Body').fontSize(11);
           y += rowHeight;
         }
-      });
+      }
 
-      doc.moveDown(1.5);
+      doc.moveDown(1.2);
 
-      // Totals
+      // ===== Totals
       const subtotalStr = this.formatMoney(invoice.subtotal);
       const taxAmountStr = this.formatMoney(invoice.taxAmount ?? 0);
       const totalStr = this.formatMoney(invoice.total);
 
+      const totalsX = left + usableWidth * 0.7;
+
+      doc
+        .font('Body')
+        .fontSize(11)
+        .text('Subtotal:', totalsX, doc.y, {
+          align: 'right',
+          width: usableWidth * 0.28,
+        });
+      doc.text(`${subtotalStr} ${invoice.currency}`, { align: 'right' });
+
+      doc.moveDown(0.3);
+      doc.text('Tax:', totalsX, doc.y, {
+        align: 'right',
+        width: usableWidth * 0.28,
+      });
+      doc.text(`${taxAmountStr} ${invoice.currency}`, { align: 'right' });
+
+      doc.moveDown(0.3);
+      doc
+        .font('BodyBold')
+        .fontSize(14)
+        .text('Total:', totalsX, doc.y, {
+          align: 'right',
+          width: usableWidth * 0.28,
+        });
+      doc.text(`${totalStr} ${invoice.currency}`, { align: 'right' });
+
+      // ===== Payment details (2 columns)
+      doc.moveDown(1.6);
+      doc
+        .font('BodyBold')
+        .fontSize(11)
+        .text('Payment details', { underline: true });
+      doc.moveDown(0.5);
+
+      const leftColumn = [
+        `Beneficiary: ${org.beneficiaryName || org.legalName || org.name || '—'}`,
+        org.iban ? `IBAN: ${this.formatIban(org.iban)}` : null,
+        org.swiftBic ? `SWIFT/BIC: ${org.swiftBic}` : null,
+        org.bankName ? `Bank: ${org.bankName}` : null,
+        org.bankAddress ? `Bank address: ${org.bankAddress}` : null,
+      ].filter(Boolean) as string[];
+
+      const rightColumn = [
+        org.vatId ? `VAT/Tax ID: ${org.vatId}` : null,
+        org.registrationNumber ? `Reg. No: ${org.registrationNumber}` : null,
+        org.legalAddress ? `Legal address: ${org.legalAddress}` : null,
+        `Reference: ${
+          org.paymentReferenceHint ||
+          'Please use the invoice number as payment reference.'
+        }`,
+      ].filter(Boolean) as string[];
+
+      const startY = doc.y;
+      const colWidth = usableWidth / 2 - 10;
+
+      doc.font('Body').fontSize(9);
+      doc.text(leftColumn.join('\n'), left, startY, { width: colWidth });
+      doc.text(rightColumn.join('\n'), left + colWidth + 20, startY, {
+        width: colWidth,
+      });
+
+      doc.moveDown(6);
+
+      // ===== Notes
+      doc.font('BodyBold').fontSize(11).text('Notes', { underline: true });
+      doc.moveDown(0.3);
       doc
         .font('Body')
         .fontSize(10)
-        .text(`Subtotal: ${subtotalStr} ${invoice.currency}`, {
-          align: 'right',
-        });
-      doc
-        .font('Body')
-        .text(`Tax: ${taxAmountStr} ${invoice.currency}`, { align: 'right' });
-      doc
-        .font('BodyBold')
-        .fontSize(12)
-        .text(`Total: ${totalStr} ${invoice.currency}`, { align: 'right' });
-
-      doc.moveDown(1.5);
-
-      // Notes / Payment instructions
-      doc.font('BodyBold').fontSize(10).text('Notes', { underline: true });
-      doc.font('Body').fontSize(9);
-      doc.text(
-        invoice.notes
-          ? String(invoice.notes)
-          : 'Payment instructions: please use invoice number as payment reference.',
-      );
+        .text(invoice.notes?.trim() || '—', { width: usableWidth });
 
       doc.end();
     });
@@ -446,24 +503,23 @@ export class InvoicePdfService {
         client: true,
         organization: true,
         createdBy: true,
+        pdfDocument: true,
+        pdfInternationalDocument: true,
       },
     });
 
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    const safeNumber = invoice.number.replace(/[^a-zA-Z0-9\-]/g, '_');
-
+    const safeNumber = String(invoice.number).replace(/[^a-zA-Z0-9\-]/g, '_');
     const fileName =
       kind === 'UA'
-        ? `invoice-${safeNumber}.pdf`
-        : `invoice-${safeNumber}-international.pdf`;
+        ? `invoice-ua-${safeNumber}.pdf`
+        : `invoice-intl-${safeNumber}.pdf`;
 
     const pdfBuffer =
       kind === 'UA'
-        ? await this.buildUaPdfBuffer(invoice)
-        : await this.buildInternationalPdfBuffer(invoice);
+        ? await this.buildPdfBufferUa(invoice)
+        : await this.buildPdfBufferInternational(invoice);
 
     const storageKey = await this.fileStorage.uploadFile(
       {
@@ -477,7 +533,7 @@ export class InvoicePdfService {
     const existingDocumentId =
       kind === 'UA'
         ? invoice.pdfDocumentId
-        : invoice.internationalPdfDocumentId;
+        : invoice.pdfInternationalDocumentId;
 
     if (existingDocumentId) {
       await this.prisma.document.update({
@@ -491,7 +547,7 @@ export class InvoicePdfService {
         },
       });
 
-      return { documentId: existingDocumentId, storageKey };
+      return { storageKey, documentId: existingDocumentId };
     }
 
     const docRecord = await this.prisma.document.create({
@@ -500,8 +556,8 @@ export class InvoicePdfService {
         createdById: requestedByUserId,
         title:
           kind === 'UA'
-            ? `Invoice ${invoice.number} (UA)`
-            : `Invoice ${invoice.number} (International)`,
+            ? `Invoice UA ${invoice.number}`
+            : `Invoice International ${invoice.number}`,
         originalName: fileName,
         mimeType: 'application/pdf',
         sizeBytes: pdfBuffer.length,
@@ -519,85 +575,83 @@ export class InvoicePdfService {
     } else {
       await this.prisma.invoice.update({
         where: { id: invoiceId },
-        data: { internationalPdfDocumentId: docRecord.id },
+        data: { pdfInternationalDocumentId: docRecord.id },
       });
     }
 
-    return { documentId: docRecord.id, storageKey };
+    return { storageKey, documentId: docRecord.id };
   }
 
-  // ===== Public methods =====
-
-  async getOrCreatePdfForInvoiceUa(invoiceId: string) {
+  private async getOrCreate(invoiceId: string, kind: PdfKind) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
-      include: { createdBy: true, pdfDocument: true },
+      include: {
+        organization: true,
+        createdBy: true,
+        pdfDocument: true,
+        pdfInternationalDocument: true,
+      },
     });
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    if (!invoice.pdfDocumentId || !invoice.pdfDocument) {
+    const hasPdf =
+      kind === 'UA'
+        ? Boolean(invoice.pdfDocumentId && invoice.pdfDocument)
+        : Boolean(
+            invoice.pdfInternationalDocumentId &&
+            invoice.pdfInternationalDocument,
+          );
+
+    if (!hasPdf) {
       const { storageKey } = await this.generateAndAttach(
         invoiceId,
         invoice.createdById,
-        'UA',
+        kind,
       );
+
+      const pdfBuffer = await this.fileStorage.getFile(storageKey);
 
       const updated = await this.prisma.invoice.findUnique({
         where: { id: invoiceId },
-        include: { pdfDocument: true },
+        include: {
+          pdfDocument: true,
+          pdfInternationalDocument: true,
+        },
       });
 
-      if (!updated?.pdfDocument) {
-        throw new NotFoundException('PDF-документ для інвойсу не знайдено');
-      }
+      const document =
+        kind === 'UA'
+          ? updated?.pdfDocument
+          : updated?.pdfInternationalDocument;
 
-      const pdfBuffer = await this.fileStorage.getFile(storageKey);
-      return { document: updated.pdfDocument, pdfBuffer };
+      if (!document)
+        throw new NotFoundException('PDF-документ для інвойсу не знайдено');
+
+      return { document, pdfBuffer };
     }
 
-    const pdfBuffer = await this.fileStorage.getFile(
-      invoice.pdfDocument.storageKey,
-    );
+    const storageKey =
+      kind === 'UA'
+        ? invoice.pdfDocument!.storageKey
+        : invoice.pdfInternationalDocument!.storageKey;
 
-    return { document: invoice.pdfDocument, pdfBuffer };
+    const pdfBuffer = await this.fileStorage.getFile(storageKey);
+
+    const document =
+      kind === 'UA' ? invoice.pdfDocument : invoice.pdfInternationalDocument;
+
+    if (!document)
+      throw new NotFoundException('PDF-документ для інвойсу не знайдено');
+
+    return { document, pdfBuffer };
+  }
+
+  async getOrCreatePdfForInvoiceUa(invoiceId: string) {
+    return this.getOrCreate(invoiceId, 'UA');
   }
 
   async getOrCreatePdfForInvoiceInternational(invoiceId: string) {
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id: invoiceId },
-      include: { createdBy: true, internationalPdfDocument: true },
-    });
-
-    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
-
-    if (
-      !invoice.internationalPdfDocumentId ||
-      !invoice.internationalPdfDocument
-    ) {
-      const { storageKey } = await this.generateAndAttach(
-        invoiceId,
-        invoice.createdById,
-        'INTERNATIONAL',
-      );
-
-      const updated = await this.prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        include: { internationalPdfDocument: true },
-      });
-
-      if (!updated?.internationalPdfDocument) {
-        throw new NotFoundException('International PDF-документ не знайдено');
-      }
-
-      const pdfBuffer = await this.fileStorage.getFile(storageKey);
-      return { document: updated.internationalPdfDocument, pdfBuffer };
-    }
-
-    const pdfBuffer = await this.fileStorage.getFile(
-      invoice.internationalPdfDocument.storageKey,
-    );
-
-    return { document: invoice.internationalPdfDocument, pdfBuffer };
+    return this.getOrCreate(invoiceId, 'INTERNATIONAL');
   }
 }
