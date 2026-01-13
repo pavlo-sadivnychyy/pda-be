@@ -1,6 +1,5 @@
 src
 test
 *.ts
-tsconfig*.json
 nest-cli.json
 README.md
