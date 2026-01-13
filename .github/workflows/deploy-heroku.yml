@@ -1,0 +1,46 @@
+name: Deploy Backend to Heroku
+
+on:
+  push:
+    branches: [ "main" ]
+
+concurrency:
+  group: heroku-deploy-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Test (optional)
+        run: npm test --if-present
+
+      - name: Build
+        run: npm run build --if-present
+
+      # Деплой через Heroku Git (найпростіше і стабільно)
+      - name: Deploy to Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+        run: |
+          git config --global user.email "$HEROKU_EMAIL"
+          git config --global user.name "github-actions"
+          curl https://cli-assets.heroku.com/install.sh | sh
+          heroku --version
+          heroku git:remote -a "$HEROKU_APP_NAME"
+          git push https://heroku:$HEROKU_API_KEY@git.heroku.com/$HEROKU_APP_NAME.git HEAD:main --force
