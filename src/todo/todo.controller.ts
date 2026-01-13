@@ -2,97 +2,130 @@ import {
   BadRequestException,
   Body,
   Controller,
-  Get,
-  Post,
-  Patch,
   Delete,
+  Get,
   Param,
+  Patch,
+  Post,
   Query,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { TodoService } from './todo.service';
 import { TodoStatus } from '@prisma/client';
 import { CreateTodoTaskDto, UpdateTodoTaskDto } from './dto/todo-task.dto';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
 class UpdateTodoStatusDto {
   status: TodoStatus;
 }
 
 class AiPlanRequestDto {
-  userId: string;
   date: string; // "YYYY-MM-DD"
 }
 
+@UseGuards(ClerkAuthGuard)
 @Controller('todo/tasks')
 export class TodoController {
   constructor(private readonly todoService: TodoService) {}
 
   // POST /todo/tasks
   @Post()
-  async create(@Body() dto: CreateTodoTaskDto) {
-    if (!dto.userId || !dto.title || !dto.startAt) {
-      throw new BadRequestException('userId, title та startAt є обовʼязковими');
+  async create(@Req() req: any, @Body() dto: CreateTodoTaskDto) {
+    const authUserId = req.authUserId as string;
+
+    if (!dto.title || !dto.startAt) {
+      throw new BadRequestException('title та startAt є обовʼязковими');
     }
 
-    const task = await this.todoService.createTask(dto);
+    const task = await this.todoService.createTask(authUserId, dto);
     return { task };
   }
 
   // PATCH /todo/tasks/:id
   @Patch(':id')
-  async update(@Param('id') id: string, @Body() dto: UpdateTodoTaskDto) {
-    const task = await this.todoService.updateTask(id, dto);
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateTodoTaskDto,
+  ) {
+    const authUserId = req.authUserId as string;
+    const task = await this.todoService.updateTask(authUserId, id, dto);
     return { task };
   }
 
-  // GET /todo/tasks/today?userId=...
+  // GET /todo/tasks/today?organizationId=...
   @Get('today')
-  async getToday(@Query('userId') userId: string) {
-    if (!userId) {
-      throw new BadRequestException('userId є обовʼязковим');
-    }
-    const items = await this.todoService.getTodayTasks(userId);
+  async getToday(
+    @Req() req: any,
+    @Query('organizationId') organizationId?: string,
+  ) {
+    const authUserId = req.authUserId as string;
+    const items = await this.todoService.getTodayTasks(
+      authUserId,
+      organizationId,
+    );
     return { items };
   }
 
-  // GET /todo/tasks/day?userId=...&date=YYYY-MM-DD
+  // GET /todo/tasks/day?date=YYYY-MM-DD&organizationId=...
   @Get('day')
   async getForDay(
-    @Query('userId') userId: string,
+    @Req() req: any,
     @Query('date') date: string,
+    @Query('organizationId') organizationId?: string,
   ) {
-    if (!userId || !date) {
-      throw new BadRequestException('userId та date є обовʼязковими');
+    const authUserId = req.authUserId as string;
+
+    if (!date) {
+      throw new BadRequestException('date є обовʼязковим');
     }
-    const items = await this.todoService.getTasksForDay(userId, date);
+
+    const items = await this.todoService.getTasksForDay(
+      authUserId,
+      date,
+      organizationId,
+    );
     return { items };
   }
 
-  // GET /todo/tasks/range?userId=...&from=YYYY-MM-DD&to=YYYY-MM-DD
+  // GET /todo/tasks/range?from=YYYY-MM-DD&to=YYYY-MM-DD&organizationId=...
   @Get('range')
   async getForRange(
-    @Query('userId') userId: string,
+    @Req() req: any,
     @Query('from') from: string,
     @Query('to') to: string,
+    @Query('organizationId') organizationId?: string,
   ) {
-    if (!userId || !from || !to) {
-      throw new BadRequestException('userId, from та to є обовʼязковими');
+    const authUserId = req.authUserId as string;
+
+    if (!from || !to) {
+      throw new BadRequestException('from та to є обовʼязковими');
     }
 
-    const items = await this.todoService.getTasksForRange(userId, from, to);
+    const items = await this.todoService.getTasksForRange(
+      authUserId,
+      from,
+      to,
+      organizationId,
+    );
     return { items };
   }
 
   // PATCH /todo/tasks/:id/status
   @Patch(':id/status')
   async updateStatus(
+    @Req() req: any,
     @Param('id') id: string,
     @Body() dto: UpdateTodoStatusDto,
   ) {
+    const authUserId = req.authUserId as string;
+
     if (!dto.status) {
       throw new BadRequestException('status є обовʼязковим');
     }
 
-    const task = await this.todoService.updateTask(id, {
+    const task = await this.todoService.updateTask(authUserId, id, {
       status: dto.status,
     });
     return { task };
@@ -100,35 +133,36 @@ export class TodoController {
 
   // DELETE /todo/tasks/:id
   @Delete(':id')
-  async remove(@Param('id') id: string) {
-    await this.todoService.deleteTask(id);
+  async remove(@Req() req: any, @Param('id') id: string) {
+    const authUserId = req.authUserId as string;
+    await this.todoService.deleteTask(authUserId, id);
     return { success: true };
   }
 
-  // GET /todo/tasks/ai-plan?userId=...&date=YYYY-MM-DD
+  // GET /todo/tasks/ai-plan?date=YYYY-MM-DD
   @Get('ai-plan')
-  async getAiPlan(
-    @Query('userId') userId: string,
-    @Query('date') date: string,
-  ) {
-    if (!userId || !date) {
-      throw new BadRequestException('userId та date є обовʼязковими');
+  async getAiPlan(@Req() req: any, @Query('date') date: string) {
+    const authUserId = req.authUserId as string;
+
+    if (!date) {
+      throw new BadRequestException('date є обовʼязковим');
     }
 
-    const plan = await this.todoService.getOrCreateAiPlan(userId, date);
+    const plan = await this.todoService.getOrCreateAiPlan(authUserId, date);
     return { plan };
   }
 
   // POST /todo/tasks/ai-plan
   @Post('ai-plan')
-  async getOrCreateAiPlan(@Body() body: AiPlanRequestDto) {
-    const { userId, date } = body;
+  async getOrCreateAiPlan(@Req() req: any, @Body() body: AiPlanRequestDto) {
+    const authUserId = req.authUserId as string;
+    const { date } = body;
 
-    if (!userId || !date) {
-      throw new BadRequestException('userId та date є обовʼязковими');
+    if (!date) {
+      throw new BadRequestException('date є обовʼязковим');
     }
 
-    const plan = await this.todoService.getOrCreateAiPlan(userId, date);
+    const plan = await this.todoService.getOrCreateAiPlan(authUserId, date);
     return { plan };
   }
 }

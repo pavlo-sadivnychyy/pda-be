@@ -1,6 +1,16 @@
-import { Body, Controller, Get, Param, Patch, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { UsersService } from './users.service';
 import { PlanId } from '@prisma/client';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
 class SyncUserDto {
   authProvider: string;
@@ -15,7 +25,6 @@ class SyncUserDto {
   jobTitle?: string;
 }
 
-// ✅ Окремий DTO тільки для зміни плану
 class SetUserPlanDto {
   planId: PlanId;
 }
@@ -24,25 +33,28 @@ class SetUserPlanDto {
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
 
-  // ✅ Реєстрація/логін/синк. Тут НЕ приймаємо subscription з клієнта.
-  // При першому вході підписка створюється автоматично з FREE.
   @Post('sync')
   async syncUser(@Body() body: SyncUserDto) {
     const user = await this.usersService.upsertUser(body);
     return { user };
   }
 
-  // ✅ User + subscription
   @Get(':id')
   async getById(@Param('id') id: string) {
     const user = await this.usersService.findById(id);
     return { user };
   }
 
-  // ✅ Зміна плану (upsert subscription, потім повертаємо user + subscription)
   @Patch(':id/plan')
   async setPlan(@Param('id') id: string, @Body() body: SetUserPlanDto) {
     const user = await this.usersService.setUserPlan(id, body.planId);
     return { user };
+  }
+
+  // ✅ Оце головне: цей роут повинен брати authUserId з Bearer токена
+  @Patch('onboarding/complete')
+  @UseGuards(ClerkAuthGuard)
+  async completeOnboarding(@Req() req: any) {
+    return this.usersService.completeOnboarding(req.authUserId);
   }
 }

@@ -23,13 +23,6 @@ type UpsertUserInput = {
 export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /**
-   * ✅ Upsert user by authUserId
-   * ✅ Guarantee subscription exists:
-   *    - create subscription with FREE on first sync
-   *    - do NOT override plan on subsequent syncs
-   * ✅ Return user with subscription
-   */
   async upsertUser(input: UpsertUserInput) {
     const fullName = [input.firstName, input.lastName]
       .filter(Boolean)
@@ -62,26 +55,22 @@ export class UsersService {
       },
     });
 
-    // ✅ гарантуємо, що subscription існує (FREE by default)
-    // sync НЕ міняє план — тільки створює якщо її не було
     await this.prisma.subscription.upsert({
-      where: { userId: user.id }, // userId має бути @unique в Subscription
+      where: { userId: user.id },
       create: {
         userId: user.id,
         planId: PlanId.FREE,
         status: 'active',
       },
-      update: {}, // ❗ нічого не оновлюємо на sync
+      update: {},
     });
 
-    // ✅ повертаємо user + subscription
     return this.prisma.user.findUnique({
       where: { id: user.id },
       include: { subscription: true },
     });
   }
 
-  // ✅ User + subscription
   async findById(id: string) {
     return this.prisma.user.findUnique({
       where: { id },
@@ -96,11 +85,23 @@ export class UsersService {
     });
   }
 
-  /**
-   * ✅ Set/Change plan for user:
-   * - upsert subscription (create if missing, otherwise update planId)
-   * - return user + subscription
-   */
+  async completeOnboarding(authUserId: string) {
+    if (!authUserId) {
+      throw new BadRequestException('authUserId is required');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { authUserId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    const updated = await this.prisma.user.update({
+      where: { authUserId },
+      data: { onboardingCompleted: true },
+      select: { id: true, onboardingCompleted: true },
+    });
+
+    return { user: updated };
+  }
+
   async setUserPlan(userId: string, planId: PlanId) {
     if (!planId) throw new BadRequestException('planId is required');
 
@@ -109,14 +110,8 @@ export class UsersService {
 
     await this.prisma.subscription.upsert({
       where: { userId },
-      create: {
-        userId,
-        planId,
-        status: 'active',
-      },
-      update: {
-        planId,
-      },
+      create: { userId, planId, status: 'active' },
+      update: { planId },
     });
 
     return this.prisma.user.findUnique({

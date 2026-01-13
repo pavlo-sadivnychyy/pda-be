@@ -63,7 +63,6 @@ export class KnowledgeBaseService {
   ) {
     this.enableEmbeddings =
       (process.env.KB_ENABLE_EMBEDDINGS || 'false').toLowerCase() === 'true';
-    console.log('[KB] embeddings enabled:', this.enableEmbeddings);
   }
 
   // ---------- PUBLIC ----------

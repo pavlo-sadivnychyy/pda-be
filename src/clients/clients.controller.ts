@@ -7,29 +7,37 @@ import {
   Patch,
   Post,
   Query,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { ClientsService } from './clients.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
+@UseGuards(ClerkAuthGuard)
 @Controller('clients')
 export class ClientsController {
   constructor(private readonly clientsService: ClientsService) {}
 
   // POST /clients
   @Post()
-  async create(@Body() dto: CreateClientDto) {
-    const client = await this.clientsService.create(dto);
+  async create(@Req() req: any, @Body() dto: CreateClientDto) {
+    const authUserId = req.authUserId as string;
+    const client = await this.clientsService.create(authUserId, dto);
     return { client };
   }
 
   // GET /clients?organizationId=...&search=...
   @Get()
   async findAll(
+    @Req() req: any,
     @Query('organizationId') organizationId: string,
     @Query('search') search?: string,
   ) {
-    const clients = await this.clientsService.findAll({
+    const authUserId = req.authUserId as string;
+
+    const clients = await this.clientsService.findAll(authUserId, {
       organizationId,
       search,
     });
@@ -39,22 +47,28 @@ export class ClientsController {
 
   // GET /clients/:id
   @Get(':id')
-  async findOne(@Param('id') id: string) {
-    const client = await this.clientsService.findOne(id);
+  async findOne(@Req() req: any, @Param('id') id: string) {
+    const authUserId = req.authUserId as string;
+    const client = await this.clientsService.findOne(authUserId, id);
     return { client };
   }
 
   // PATCH /clients/:id
   @Patch(':id')
-  async update(@Param('id') id: string, @Body() dto: UpdateClientDto) {
-    const client = await this.clientsService.update(id, dto);
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateClientDto,
+  ) {
+    const authUserId = req.authUserId as string;
+    const client = await this.clientsService.update(authUserId, id, dto);
     return { client };
   }
 
   // DELETE /clients/:id
   @Delete(':id')
-  async remove(@Param('id') id: string) {
-    const result = await this.clientsService.remove(id);
-    return result;
+  async remove(@Req() req: any, @Param('id') id: string) {
+    const authUserId = req.authUserId as string;
+    return this.clientsService.remove(authUserId, id);
   }
 }

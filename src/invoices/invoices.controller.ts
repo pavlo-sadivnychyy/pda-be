@@ -8,6 +8,8 @@ import {
   Post,
   Query,
   Res,
+  UseGuards,
+  Req,
 } from '@nestjs/common';
 import { InvoicesService } from './invoices.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -15,7 +17,9 @@ import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus } from '@prisma/client';
 import { InvoicePdfService } from './invoice-pdf.service';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
+@UseGuards(ClerkAuthGuard) // 🔐 ВСІ /invoices/* тепер приватні
 @Controller('invoices')
 export class InvoicesController {
   constructor(
@@ -39,8 +43,9 @@ export class InvoicesController {
   }
 
   @Post()
-  async create(@Body() dto: CreateInvoiceDto) {
-    const invoice = await this.invoicesService.create(dto);
+  async create(@Body() dto: CreateInvoiceDto, @Req() req: any) {
+    // ✅ createdByAuthUserId приходить з guard
+    const invoice = await this.invoicesService.create(dto, req.authUserId);
     return { invoice };
   }
 
@@ -95,7 +100,6 @@ export class InvoicesController {
     return { invoice };
   }
 
-  // ===== PDF UA =====
   @Get(':id/pdf')
   async getPdfUa(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
@@ -109,7 +113,6 @@ export class InvoicesController {
     res.end(pdfBuffer);
   }
 
-  // ===== PDF INTERNATIONAL =====
   @Get(':id/pdf-international')
   async getPdfInternational(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =

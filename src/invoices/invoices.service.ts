@@ -97,10 +97,14 @@ export class InvoicesService {
     };
   }
 
-  async create(dto: CreateInvoiceDto) {
+  /**
+   * ✅ Create invoice:
+   * - createdByAuthUserId приходить з Clerk guard (req.authUserId)
+   * - мапимо його на нашого User.id
+   */
+  async create(dto: CreateInvoiceDto, createdByAuthUserId: string) {
     const {
       organizationId,
-      createdById,
       items,
       clientId,
       issueDate,
@@ -108,12 +112,24 @@ export class InvoicesService {
       currency,
       status,
       notes,
-    } = dto;
+    } = dto as any;
 
-    if (!organizationId || !createdById) {
-      throw new BadRequestException(
-        'organizationId та createdById є обовʼязковими',
-      );
+    if (!organizationId) {
+      throw new BadRequestException('organizationId є обовʼязковим');
+    }
+
+    if (!createdByAuthUserId) {
+      throw new BadRequestException('auth user id is required');
+    }
+
+    // ✅ знайти твого user в БД по Clerk authUserId
+    const createdByUser = await this.prisma.user.findUnique({
+      where: { authUserId: createdByAuthUserId },
+      select: { id: true },
+    });
+
+    if (!createdByUser) {
+      throw new NotFoundException('User not found (sync user first)');
     }
 
     if (!items || items.length === 0) {
@@ -132,7 +148,7 @@ export class InvoicesService {
     return this.prisma.invoice.create({
       data: {
         organizationId,
-        createdById,
+        createdById: createdByUser.id, // ✅ твій User.id
         clientId: clientId ?? null,
         number,
         issueDate: issueDateParsed,
@@ -151,7 +167,7 @@ export class InvoicesService {
         paidAt: null,
 
         items: {
-          create: items.map((item, index) => ({
+          create: items.map((item: any, index: number) => ({
             name: item.name,
             description: item.description ?? null,
             quantity: item.quantity,

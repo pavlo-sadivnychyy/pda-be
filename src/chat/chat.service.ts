@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   ForbiddenException,
+  BadRequestException,
 } from '@nestjs/common';
 import {
   ChatMessageRole,
@@ -20,9 +21,33 @@ export class ChatService {
     private readonly ai: AiService,
   ) {}
 
+  // ✅ clerk authUserId -> db userId
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
   // --------- СЕСІЇ ---------
 
-  async listSessionsForOrg(organizationId: string, userId: string) {
+  async listSessionsForOrg(params: {
+    organizationId: string;
+    authUserId: string;
+  }) {
+    const { organizationId, authUserId } = params;
+
+    const userId = await this.resolveDbUserId(authUserId);
     await this.ensureUserInOrganization(organizationId, userId);
 
     return this.prisma.chatSession.findMany({
@@ -32,7 +57,11 @@ export class ChatService {
     });
   }
 
-  async getSessionById(id: string, userId: string) {
+  async getSessionById(params: { id: string; authUserId: string }) {
+    const { id, authUserId } = params;
+
+    const userId = await this.resolveDbUserId(authUserId);
+
     const session = await this.prisma.chatSession.findUnique({
       where: { id },
       include: {
@@ -53,11 +82,12 @@ export class ChatService {
 
   async createSession(params: {
     organizationId: string;
-    createdById: string;
+    authUserId: string;
     title?: string;
   }) {
-    const { organizationId, createdById, title } = params;
+    const { organizationId, authUserId, title } = params;
 
+    const createdById = await this.resolveDbUserId(authUserId);
     await this.ensureUserInOrganization(organizationId, createdById);
 
     const session = await this.prisma.chatSession.create({
@@ -73,7 +103,11 @@ export class ChatService {
   }
 
   // ✅ DELETE session (+ messages) — hard delete
-  async deleteSession(sessionId: string, userId: string) {
+  async deleteSession(params: { sessionId: string; authUserId: string }) {
+    const { sessionId, authUserId } = params;
+
+    const userId = await this.resolveDbUserId(authUserId);
+
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
       select: { id: true, organizationId: true },
@@ -85,7 +119,6 @@ export class ChatService {
 
     await this.ensureUserInOrganization(session.organizationId, userId);
 
-    // важливо: якщо в Prisma нема onDelete: Cascade — треба чистити вручну
     await this.prisma.$transaction([
       this.prisma.chatMessage.deleteMany({
         where: { sessionId: session.id },
@@ -102,10 +135,12 @@ export class ChatService {
 
   async sendMessage(params: {
     sessionId: string;
-    userId: string;
+    authUserId: string;
     content: string;
   }) {
-    const { sessionId, userId, content } = params;
+    const { sessionId, authUserId, content } = params;
+
+    const userId = await this.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },

@@ -10,12 +10,14 @@ import {
   UseInterceptors,
   UploadedFile,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
 
 import { KnowledgeBaseService } from './knowledge-base.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
 class CreateDocumentDto {
   organizationId: string;
@@ -59,6 +61,7 @@ function encodeRFC5987(str: string) {
     .replace(/\*/g, '%2A');
 }
 
+@UseGuards(ClerkAuthGuard)
 @Controller('knowledge-base')
 export class KnowledgeBaseController {
   constructor(

@@ -2,22 +2,23 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Param,
-  Post,
-  Query,
   Patch,
-  Delete,
+  Post,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { OrganizationsService } from './organizations.service';
 import {
   AddMemberDto,
   UpdateMemberRoleDto,
 } from './dto/organization-members.dto';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
 class CreateOrganizationDto {
   name: string;
-  ownerId: string;
 
   industry?: string;
   description?: string;
@@ -85,75 +86,95 @@ class UpdateOrganizationDto {
   preferredPlatforms?: string[];
 }
 
+@UseGuards(ClerkAuthGuard)
 @Controller('organizations')
 export class OrganizationsController {
   constructor(private readonly organizationsService: OrganizationsService) {}
 
+  // ✅ create org for current auth user (без ownerId з фронта)
   @Post()
-  async create(@Body() body: CreateOrganizationDto) {
-    if (!body.name || !body.ownerId) {
-      throw new BadRequestException('name and ownerId are required');
+  async create(@Req() req: any, @Body() body: CreateOrganizationDto) {
+    if (!body.name) {
+      throw new BadRequestException('name is required');
     }
 
-    const org = await this.organizationsService.createOrganization(body);
+    const org = await this.organizationsService.createOrganization(
+      req.authUserId,
+      body,
+    );
     return { organization: org };
   }
 
+  // ✅ update only by owner (service check)
   @Patch(':id')
-  async update(@Param('id') id: string, @Body() body: UpdateOrganizationDto) {
-    const org = await this.organizationsService.updateOrganization(id, body);
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() body: UpdateOrganizationDto,
+  ) {
+    const org = await this.organizationsService.updateOrganization(
+      req.authUserId,
+      id,
+      body,
+    );
     return { organization: org };
   }
 
+  // ✅ get orgs for current user (без userId query)
   @Get()
-  async getForUser(@Query('userId') userId?: string) {
-    if (!userId) {
-      throw new BadRequestException('userId query param is required');
-    }
-
+  async getForCurrentUser(@Req() req: any) {
     const links =
-      await this.organizationsService.getOrganizationsForUser(userId);
+      await this.organizationsService.getOrganizationsForCurrentUser(
+        req.authUserId,
+      );
     return { items: links };
   }
 
+  // ✅ get by id (service checks membership)
   @Get(':id')
-  async getById(@Param('id') id: string) {
-    const org = await this.organizationsService.getOrganizationById(id);
-    if (!org) throw new BadRequestException('Organization not found');
+  async getById(@Req() req: any, @Param('id') id: string) {
+    const org = await this.organizationsService.getOrganizationById(
+      req.authUserId,
+      id,
+    );
     return { organization: org };
   }
 
+  // ✅ members (service checks membership)
   @Get(':id/members')
-  async getMembers(
-    @Param('id') organizationId: string,
-    @Query('currentUserId') currentUserId: string,
-  ) {
+  async getMembers(@Req() req: any, @Param('id') organizationId: string) {
     const items = await this.organizationsService.getOrganizationMembers(
+      req.authUserId,
       organizationId,
-      currentUserId,
     );
     return { items };
   }
 
+  // ✅ add member (service checks owner)
   @Post(':id/members')
   async addMember(
+    @Req() req: any,
     @Param('id') organizationId: string,
     @Body() dto: AddMemberDto,
   ) {
     const member = await this.organizationsService.addMember(
+      req.authUserId,
       organizationId,
       dto,
     );
     return { member };
   }
 
+  // ✅ update role (service checks owner)
   @Patch(':id/members/:userId')
   async updateMemberRole(
+    @Req() req: any,
     @Param('id') organizationId: string,
     @Param('userId') memberUserId: string,
     @Body() dto: UpdateMemberRoleDto,
   ) {
     const member = await this.organizationsService.updateMemberRole(
+      req.authUserId,
       organizationId,
       memberUserId,
       dto,
@@ -161,16 +182,17 @@ export class OrganizationsController {
     return { member };
   }
 
+  // ✅ remove member (service checks owner)
   @Delete(':id/members/:userId')
   async removeMember(
+    @Req() req: any,
     @Param('id') organizationId: string,
     @Param('userId') memberUserId: string,
-    @Query('currentUserId') currentUserId: string,
   ) {
     const result = await this.organizationsService.removeMember(
+      req.authUserId,
       organizationId,
       memberUserId,
-      currentUserId,
     );
     return result;
   }

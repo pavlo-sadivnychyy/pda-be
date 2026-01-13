@@ -11,10 +11,47 @@ import { UpdateClientDto } from './dto/update-client.dto';
 export class ClientsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async create(dto: CreateClientDto) {
+  // ✅ clerk authUserId -> db userId (User.id)
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
+  // ✅ (опціонально, але раджу) перевірка доступу до організації
+  private async assertOrgAccess(dbUserId: string, organizationId: string) {
+    if (!organizationId)
+      throw new BadRequestException('organizationId is required');
+
+    const membership = await this.prisma.userOrganization.findUnique({
+      where: { userId_organizationId: { userId: dbUserId, organizationId } },
+      select: { id: true },
+    });
+
+    // якщо у тебе тільки owner - можеш перевіряти org.ownerId === dbUserId
+    if (!membership) {
+      throw new BadRequestException('No access to this organization');
+    }
+  }
+
+  async create(authUserId: string, dto: CreateClientDto) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const {
       organizationId,
-      createdById,
+      // createdById ігноруємо (бо може бути підміна)
+      createdById: _ignoreCreatedById,
       name,
       contactName,
       email,
@@ -22,13 +59,13 @@ export class ClientsService {
       taxNumber,
       address,
       notes,
-    } = dto;
+    } = dto as any;
 
-    if (!organizationId || !createdById) {
-      throw new BadRequestException(
-        'organizationId та createdById є обовʼязковими',
-      );
+    if (!organizationId) {
+      throw new BadRequestException('organizationId є обовʼязковим');
     }
+
+    await this.assertOrgAccess(dbUserId, organizationId);
 
     if (!name) {
       throw new BadRequestException('Поле name є обовʼязковим');
@@ -37,7 +74,7 @@ export class ClientsService {
     const client = await this.prisma.client.create({
       data: {
         organizationId,
-        createdById,
+        createdById: dbUserId, // ✅ справжній userId з DB
         name,
         contactName: contactName ?? null,
         email: email ?? null,
@@ -51,16 +88,21 @@ export class ClientsService {
     return client;
   }
 
-  async findAll(params: { organizationId: string; search?: string }) {
+  async findAll(
+    authUserId: string,
+    params: { organizationId: string; search?: string },
+  ) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const { organizationId, search } = params;
 
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    const where: any = {
-      organizationId,
-    };
+    await this.assertOrgAccess(dbUserId, organizationId);
+
+    const where: any = { organizationId };
 
     if (search && search.trim().length > 0) {
       const q = search.trim();
@@ -73,17 +115,15 @@ export class ClientsService {
       ];
     }
 
-    const clients = await this.prisma.client.findMany({
+    return this.prisma.client.findMany({
       where,
-      orderBy: {
-        createdAt: 'desc',
-      },
+      orderBy: { createdAt: 'desc' },
     });
-
-    return clients;
   }
 
-  async findOne(id: string) {
+  async findOne(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const client = await this.prisma.client.findUnique({
       where: { id },
     });
@@ -92,10 +132,14 @@ export class ClientsService {
       throw new NotFoundException('Клієнта не знайдено');
     }
 
+    await this.assertOrgAccess(dbUserId, client.organizationId);
+
     return client;
   }
 
-  async update(id: string, dto: UpdateClientDto) {
+  async update(authUserId: string, id: string, dto: UpdateClientDto) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.client.findUnique({
       where: { id },
     });
@@ -104,7 +148,9 @@ export class ClientsService {
       throw new NotFoundException('Клієнта не знайдено');
     }
 
-    const client = await this.prisma.client.update({
+    await this.assertOrgAccess(dbUserId, existing.organizationId);
+
+    return this.prisma.client.update({
       where: { id },
       data: {
         name: dto.name ?? undefined,
@@ -116,19 +162,21 @@ export class ClientsService {
         notes: dto.notes ?? undefined,
       },
     });
-
-    return client;
   }
 
-  async remove(id: string) {
+  async remove(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.client.findUnique({
       where: { id },
-      select: { id: true, name: true },
+      select: { id: true, name: true, organizationId: true },
     });
 
     if (!existing) {
       throw new NotFoundException('Клієнта не знайдено');
     }
+
+    await this.assertOrgAccess(dbUserId, existing.organizationId);
 
     // 1) Перевіряємо акти
     const actsCount = await this.prisma.act.count({
@@ -141,7 +189,7 @@ export class ClientsService {
       );
     }
 
-    // 2) Перевіряємо інвойси (щоб не впиратися в Invoice_clientId_fkey)
+    // 2) Перевіряємо інвойси
     const invoicesCount = await this.prisma.invoice.count({
       where: { clientId: id },
     });
@@ -152,9 +200,7 @@ export class ClientsService {
       );
     }
 
-    await this.prisma.client.delete({
-      where: { id },
-    });
+    await this.prisma.client.delete({ where: { id } });
 
     return { success: true };
   }

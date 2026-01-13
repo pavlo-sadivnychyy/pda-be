@@ -13,7 +13,6 @@ import { PrismaService } from '../prisma/prisma.service';
 
 type CreateOrganizationInput = {
   name: string;
-  ownerId: string;
 
   description?: string | null;
   industry?: string | null;
@@ -89,16 +88,36 @@ type UserOrganizationWithUser = Prisma.UserOrganizationGetPayload<{
 export class OrganizationsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async createOrganization(input: CreateOrganizationInput) {
-    if (!input.ownerId) throw new BadRequestException('ownerId is required');
+  // ✅ clerk authUserId -> db userId
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
+  async createOrganization(authUserId: string, input: CreateOrganizationInput) {
+    const ownerId = await this.resolveDbUserId(authUserId);
+
+    if (!ownerId) throw new BadRequestException('ownerId is required');
 
     const owner = await this.prisma.user.findUnique({
-      where: { id: input.ownerId },
+      where: { id: ownerId },
     });
     if (!owner) throw new BadRequestException('Owner user not found');
 
     const existingOrgForOwner = await this.prisma.organization.findFirst({
-      where: { ownerId: input.ownerId },
+      where: { ownerId },
     });
     if (existingOrgForOwner) {
       throw new BadRequestException('User already owns an organization');
@@ -111,7 +130,7 @@ export class OrganizationsService {
         data: {
           name: input.name,
           slug,
-          ownerId: input.ownerId,
+          ownerId,
 
           industry: input.industry ?? null,
           description: input.description ?? null,
@@ -146,7 +165,7 @@ export class OrganizationsService {
 
           members: {
             create: {
-              userId: input.ownerId,
+              userId: ownerId,
               role: OrganizationRole.OWNER,
               status: OrganizationMemberStatus.ACTIVE,
               joinedAt: new Date(),
@@ -200,41 +219,32 @@ export class OrganizationsService {
     }
   }
 
-  async getOrganizationsForUser(userId?: string) {
-    if (userId) {
-      const memberships = await this.prisma.userOrganization.findMany({
-        where: { userId },
-        include: {
-          organization: {
-            include: {
-              businessProfile: true,
-              members: { include: { user: true } },
-            },
+  // ✅ тепер повертаємо організації поточного користувача (без userId з query)
+  async getOrganizationsForCurrentUser(authUserId: string) {
+    const userId = await this.resolveDbUserId(authUserId);
+
+    const memberships = await this.prisma.userOrganization.findMany({
+      where: { userId },
+      include: {
+        organization: {
+          include: {
+            businessProfile: true,
+            members: { include: { user: true } },
           },
         },
-        orderBy: { createdAt: 'asc' },
-      });
-      return memberships;
-    }
-
-    const organizations = await this.prisma.organization.findMany({
-      include: { businessProfile: true, members: { include: { user: true } } },
+      },
       orderBy: { createdAt: 'asc' },
     });
 
-    return organizations.map((org) => ({
-      id: org.id,
-      role: 'owner',
-      status: 'active',
-      userId: null,
-      organizationId: org.id,
-      organization: org,
-      createdAt: (org as any)['createdAt'],
-      updatedAt: (org as any)['updatedAt'],
-    }));
+    return memberships;
   }
 
-  async getOrganizationById(id: string) {
+  async getOrganizationById(authUserId: string, id: string) {
+    const userId = await this.resolveDbUserId(authUserId);
+
+    // ✅ перевіряємо доступ (membership або owner)
+    await this.ensureUserInOrganization(id, userId);
+
     const organization = await this.prisma.organization.findUnique({
       where: { id },
       include: { businessProfile: true, members: { include: { user: true } } },
@@ -244,7 +254,16 @@ export class OrganizationsService {
     return organization;
   }
 
-  async updateOrganization(id: string, input: UpdateOrganizationInput) {
+  async updateOrganization(
+    authUserId: string,
+    id: string,
+    input: UpdateOrganizationInput,
+  ) {
+    const userId = await this.resolveDbUserId(authUserId);
+
+    // ✅ тільки OWNER може апдейтити
+    await this.ensureOwner(id, userId);
+
     const existing = await this.prisma.organization.findUnique({
       where: { id },
       include: { businessProfile: true },
@@ -354,7 +373,9 @@ export class OrganizationsService {
     return updated;
   }
 
-  async getOrganizationMembers(organizationId: string, currentUserId: string) {
+  async getOrganizationMembers(authUserId: string, organizationId: string) {
+    const currentUserId = await this.resolveDbUserId(authUserId);
+
     await this.ensureUserInOrganization(organizationId, currentUserId);
 
     const memberships = await this.prisma.userOrganization.findMany({
@@ -374,10 +395,12 @@ export class OrganizationsService {
   }
 
   async addMember(
+    authUserId: string,
     organizationId: string,
-    input: { currentUserId: string; userId: string; role?: OrganizationRole },
+    input: { userId: string; role?: OrganizationRole },
   ) {
-    const { currentUserId, userId, role } = input;
+    const currentUserId = await this.resolveDbUserId(authUserId);
+    const { userId, role } = input;
 
     await this.ensureOwner(organizationId, currentUserId);
 
@@ -423,11 +446,13 @@ export class OrganizationsService {
   }
 
   async updateMemberRole(
+    authUserId: string,
     organizationId: string,
     memberUserId: string,
-    input: { currentUserId: string; role: OrganizationRole },
+    input: { role: OrganizationRole },
   ) {
-    const { currentUserId, role } = input;
+    const currentUserId = await this.resolveDbUserId(authUserId);
+    const { role } = input;
 
     await this.ensureOwner(organizationId, currentUserId);
 
@@ -466,10 +491,12 @@ export class OrganizationsService {
   }
 
   async removeMember(
+    authUserId: string,
     organizationId: string,
     memberUserId: string,
-    currentUserId: string,
   ) {
+    const currentUserId = await this.resolveDbUserId(authUserId);
+
     await this.ensureOwner(organizationId, currentUserId);
 
     if (currentUserId === memberUserId) {
@@ -491,7 +518,6 @@ export class OrganizationsService {
   ) {
     const membership = await this.prisma.userOrganization.findFirst({
       where: { organizationId, userId },
-      include: { user: true },
     });
 
     if (!membership)

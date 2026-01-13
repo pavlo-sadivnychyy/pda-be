@@ -9,13 +9,17 @@ import {
   Post,
   Query,
   Res,
+  UseGuards,
 } from '@nestjs/common';
+
 import { QuotesService } from './quotes.service';
 import { QuoteStatus } from '@prisma/client';
 import { CreateQuoteDto } from './dto/create-quote.dto';
 import { UpdateQuoteDto } from './dto/update-quote.dto';
 import { QuotePdfService } from './quote-pdf.service';
+import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
+@UseGuards(ClerkAuthGuard) // ✅ весь контролер захищений
 @Controller('quotes')
 export class QuotesController {
   constructor(
@@ -31,11 +35,13 @@ export class QuotesController {
   ) {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
+
     const quotes = await this.quotesService.findAll({
       organizationId,
       status,
       clientId,
     });
+
     return { quotes };
   }
 
@@ -63,7 +69,6 @@ export class QuotesController {
     return { success: true };
   }
 
-  // ✅ SEND EMAIL (with PDF attachment)
   @Post(':id/send')
   async send(@Param('id') id: string) {
     const quote = await this.quotesService.sendQuoteByEmail(id);
@@ -94,7 +99,7 @@ export class QuotesController {
     return { invoice };
   }
 
-  // ✅ PDF endpoint (like invoices)
+  // PDF endpoint (Next proxy буде викликати цей)
   @Get(':id/pdf')
   async getPdf(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
@@ -105,6 +110,7 @@ export class QuotesController {
       'Content-Disposition',
       `inline; filename="${document.originalName}"`,
     );
+
     res.end(pdfBuffer);
   }
 }

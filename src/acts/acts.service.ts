@@ -5,21 +5,21 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
-type CreateActFromInvoiceDto = {
+type CreateActFromInvoiceInput = {
   invoiceId: string;
-  number: string; // номер акта
+  number: string;
   title?: string;
-  periodFrom?: string; // ISO
-  periodTo?: string; // ISO
+  periodFrom?: string;
+  periodTo?: string;
   notes?: string;
-  createdById: string;
+  createdByAuthUserId: string; // ✅ тепер це Clerk userId
 };
 
 @Injectable()
 export class ActsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async createFromInvoice(dto: CreateActFromInvoiceDto) {
+  async createFromInvoice(input: CreateActFromInvoiceInput) {
     const {
       invoiceId,
       number,
@@ -27,24 +27,30 @@ export class ActsService {
       periodFrom,
       periodTo,
       notes,
-      createdById,
-    } = dto;
+      createdByAuthUserId,
+    } = input;
 
     if (!number) {
       throw new BadRequestException('Поле number (номер акта) є обовʼязковим');
     }
 
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id: invoiceId },
-      include: {
-        client: true,
-        organization: true,
-      },
+    // ✅ 1) знайти твого юзера в БД по Clerk authUserId
+    const createdByUser = await this.prisma.user.findUnique({
+      where: { authUserId: createdByAuthUserId },
+      select: { id: true },
     });
 
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
+    if (!createdByUser) {
+      throw new NotFoundException('User not found (sync user first)');
     }
+
+    // ✅ 2) підтягнути invoice
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: { client: true, organization: true },
+    });
+
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
     if (!invoice.clientId) {
       throw new BadRequestException(
@@ -52,20 +58,17 @@ export class ActsService {
       );
     }
 
-    const total = invoice.total;
-    const currency = invoice.currency;
-
     const act = await this.prisma.act.create({
       data: {
         organizationId: invoice.organizationId,
         clientId: invoice.clientId,
-        createdById,
+        createdById: createdByUser.id, // ✅ тут вже твій User.id
         number,
         title: title ?? `Акт наданих послуг за інвойсом № ${invoice.number}`,
         periodFrom: periodFrom ? new Date(periodFrom) : null,
         periodTo: periodTo ? new Date(periodTo) : null,
-        total,
-        currency,
+        total: invoice.total,
+        currency: invoice.currency,
         notes: notes ?? '',
         relatedInvoiceId: invoice.id,
         status: 'DRAFT',
@@ -94,10 +97,7 @@ export class ActsService {
 
   async remove(id: string) {
     const existing = await this.prisma.act.findUnique({ where: { id } });
-    if (!existing) {
-      throw new NotFoundException('Акт не знайдено');
-    }
-
+    if (!existing) throw new NotFoundException('Акт не знайдено');
     return this.prisma.act.delete({ where: { id } });
   }
 
@@ -111,10 +111,7 @@ export class ActsService {
       },
     });
 
-    if (!act) {
-      throw new NotFoundException('Акт не знайдено');
-    }
-
+    if (!act) throw new NotFoundException('Акт не знайдено');
     return { act };
   }
 }

@@ -1,8 +1,12 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { TodoTask, TodoStatus, TodoDailyPlan } from '@prisma/client';
+import { TodoDailyPlan, TodoStatus, TodoTask } from '@prisma/client';
 import { CreateTodoTaskDto, UpdateTodoTaskDto } from './dto/todo-task.dto';
-import { startOfDay, endOfDay } from 'date-fns';
+import { endOfDay, startOfDay } from 'date-fns';
 import OpenAI from 'openai';
 
 @Injectable()
@@ -13,32 +17,69 @@ export class TodoService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  // ✅ clerk authUserId -> db userId (User.id)
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
   // ---------- BASIC TASK CRUD ----------
 
-  async createTask(dto: CreateTodoTaskDto): Promise<TodoTask> {
-    const { organizationId, userId, ...rest } = dto;
+  async createTask(
+    authUserId: string,
+    dto: CreateTodoTaskDto,
+  ): Promise<TodoTask> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    // ✅ userId з dto ігноруємо (щоб не було FK/підміни)
+    const { organizationId, userId: _ignoreUserId, ...rest } = dto as any;
+
+    if (!dto.title || !dto.startAt) {
+      throw new BadRequestException('title та startAt є обовʼязковими');
+    }
 
     return this.prisma.todoTask.create({
       data: {
         ...rest,
+        userId: dbUserId,
+        organizationId: organizationId ?? null,
         startAt: new Date(dto.startAt),
         endAt: dto.endAt ? new Date(dto.endAt) : null,
-        userId,
-        organizationId: organizationId ?? null,
       },
     });
   }
 
-  async updateTask(id: string, dto: UpdateTodoTaskDto): Promise<TodoTask> {
+  async updateTask(
+    authUserId: string,
+    id: string,
+    dto: UpdateTodoTaskDto,
+  ): Promise<TodoTask> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.todoTask.findUnique({
       where: { id },
     });
 
-    if (!existing) {
+    if (!existing) throw new NotFoundException('Task not found');
+
+    // ✅ не даємо чіпати чужі задачі
+    if (existing.userId !== dbUserId) {
       throw new NotFoundException('Task not found');
     }
 
-    const { organizationId, ...rest } = dto;
+    const { organizationId, userId: _ignoreUserId, ...rest } = dto as any;
 
     return this.prisma.todoTask.update({
       where: { id },
@@ -54,12 +95,16 @@ export class TodoService {
     });
   }
 
-  async deleteTask(id: string): Promise<void> {
+  async deleteTask(authUserId: string, id: string): Promise<void> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.todoTask.findUnique({
       where: { id },
     });
 
-    if (!existing) {
+    if (!existing) throw new NotFoundException('Task not found');
+
+    if (existing.userId !== dbUserId) {
       throw new NotFoundException('Task not found');
     }
 
@@ -67,21 +112,20 @@ export class TodoService {
   }
 
   async getTasksForDay(
-    userId: string,
+    authUserId: string,
     date: string,
     organizationId?: string,
   ): Promise<TodoTask[]> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const d = new Date(date);
     const from = startOfDay(d);
     const to = endOfDay(d);
 
     return this.prisma.todoTask.findMany({
       where: {
-        userId,
-        startAt: {
-          gte: from,
-          lte: to,
-        },
+        userId: dbUserId,
+        startAt: { gte: from, lte: to },
         ...(organizationId ? { organizationId } : {}),
       },
       orderBy: { startAt: 'asc' },
@@ -89,21 +133,20 @@ export class TodoService {
   }
 
   async getTasksForRange(
-    userId: string,
+    authUserId: string,
     fromStr: string,
     toStr: string,
     organizationId?: string,
   ): Promise<TodoTask[]> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const from = new Date(fromStr);
     const to = new Date(toStr);
 
     return this.prisma.todoTask.findMany({
       where: {
-        userId,
-        startAt: {
-          gte: from,
-          lte: to,
-        },
+        userId: dbUserId,
+        startAt: { gte: from, lte: to },
         ...(organizationId ? { organizationId } : {}),
       },
       orderBy: { startAt: 'asc' },
@@ -111,21 +154,19 @@ export class TodoService {
   }
 
   async getTodayTasks(
-    userId: string,
-    timezone?: string,
+    authUserId: string,
     organizationId?: string,
   ): Promise<TodoTask[]> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const now = new Date();
     const from = startOfDay(now);
     const to = endOfDay(now);
 
     return this.prisma.todoTask.findMany({
       where: {
-        userId,
-        startAt: {
-          gte: from,
-          lte: to,
-        },
+        userId: dbUserId,
+        startAt: { gte: from, lte: to },
         ...(organizationId ? { organizationId } : {}),
       },
       orderBy: { startAt: 'asc' },
@@ -135,31 +176,23 @@ export class TodoService {
   // ---------- AI DAILY PLAN (1 per day per user) ----------
 
   async getOrCreateAiPlan(
-    userId: string,
+    authUserId: string,
     date: string, // "YYYY-MM-DD"
   ): Promise<TodoDailyPlan> {
-    // 1. шукаємо існуючий план
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.todoDailyPlan.findFirst({
-      where: {
-        userId,
-        date,
-      },
+      where: { userId: dbUserId, date },
     });
 
-    if (existing) {
-      return existing;
-    }
+    if (existing) return existing;
 
-    // 2. тягнемо задачі на цей день
-    const tasks = await this.getTasksForDay(userId, date);
-
-    // 3. генеруємо план через OpenAI
+    const tasks = await this.getTasksForDay(authUserId, date);
     const plan = await this.generateAiPlanFromTasks(tasks, date);
 
-    // 4. зберігаємо в БД
     return this.prisma.todoDailyPlan.create({
       data: {
-        userId,
+        userId: dbUserId,
         date,
         summary: plan.summary,
         suggestions: plan.suggestions,
@@ -176,7 +209,6 @@ export class TodoService {
     suggestions: string[];
     timeline: { time: string; task: string; status: TodoStatus }[];
   }> {
-    // якщо задач немає – дефолт без OpenAI
     if (!tasks || tasks.length === 0) {
       return {
         summary:
@@ -190,7 +222,7 @@ export class TodoService {
     }
 
     const systemPrompt = `
-Ти асистент-планувальник. Отримуєш список задач користувача на день (з часом, пріоритетами та статусами) 
+Ти асистент-планувальник. Отримуєш список задач користувача на день (з часом, пріоритетами та статусами)
 і маєш скласти структурований план дня.
 
 Відповідай строго у JSON у форматі:
@@ -202,7 +234,7 @@ export class TodoService {
   ]
 }
 
-status у timeline повинен бути одним із: "PENDING", "IN_PROGRESS", "DONE", "CANCELLED".
+status у timeline: "PENDING" | "IN_PROGRESS" | "DONE" | "CANCELLED".
 `;
 
     const userContent = {
@@ -221,10 +253,7 @@ status у timeline повинен бути одним із: "PENDING", "IN_PROGR
       model: 'gpt-4.1-mini',
       messages: [
         { role: 'system', content: systemPrompt },
-        {
-          role: 'user',
-          content: JSON.stringify(userContent),
-        },
+        { role: 'user', content: JSON.stringify(userContent) },
       ],
       response_format: { type: 'json_object' },
       temperature: 0.4,
@@ -275,12 +304,8 @@ status у timeline повинен бути одним із: "PENDING", "IN_PROGR
 
         return { time, task, status };
       })
-      .filter(Boolean);
+      .filter(Boolean) as { time: string; task: string; status: TodoStatus }[];
 
-    return {
-      summary,
-      suggestions,
-      timeline,
-    };
+    return { summary, suggestions, timeline };
   }
 }
