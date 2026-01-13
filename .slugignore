@@ -1,5 +1,5 @@
-src
 test
-*.ts
-nest-cli.json
+coverage
+*.spec.ts
+*.map
 README.md
