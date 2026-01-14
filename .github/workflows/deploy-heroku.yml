@@ -1,11 +1,11 @@
-name: Deploy Backend to Heroku
+name: Deploy Backend to Heroku (dev only)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "dev" ]
 
 concurrency:
-  group: heroku-deploy-main
+  group: heroku-deploy-dev
   cancel-in-progress: true
 
 jobs:
@@ -40,4 +40,5 @@ jobs:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
           HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
         run: |
+          echo "Deploying dev branch to Heroku: $HEROKU_APP_NAME"
           git push https://heroku:$HEROKU_API_KEY@git.heroku.com/$HEROKU_APP_NAME.git HEAD:main --force
