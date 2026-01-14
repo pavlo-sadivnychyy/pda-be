@@ -258,11 +258,11 @@ model Quote {
   clientId       String?
   createdById    String
 
-  number     String   @unique
+  number     String
   issueDate  DateTime @default(now())
   validUntil DateTime?
 
-  currency String @default("USD")
+  currency String     @default("USD")
   status   QuoteStatus @default(DRAFT)
 
   subtotal  Decimal  @db.Decimal(18, 2)
@@ -271,10 +271,8 @@ model Quote {
 
   notes String?
 
-  // ✅ NEW: коли реально відправили клієнту
   sentAt DateTime?
 
-  // ✅ (опціонально, корисно для дебагу)
   lastEmailedTo  String?
   emailMessageId String?
 
@@ -289,10 +287,14 @@ model Quote {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
   pdfDocumentId String?   @unique
   pdfDocument   Document? @relation("QuoteDocument", fields: [pdfDocumentId], references: [id])
 
+  @@unique([organizationId, number])
+  @@index([organizationId, createdAt])
 }
+
 
 
 model QuoteItem {
@@ -434,7 +436,7 @@ model Invoice {
   clientId       String? // може бути null, якщо інвойс без клієнта
   createdById    String
 
-  number    String    @unique
+  number    String
   issueDate DateTime
   dueDate   DateTime?
 
@@ -467,6 +469,9 @@ model Invoice {
   items InvoiceItem[]
   acts  Act[]
   convertedFromQuote Quote?
+
+  @@unique([organizationId, number])
+  @@index([organizationId, createdAt])
 }
 
 
@@ -494,26 +499,20 @@ model Act {
   clientId       String
   createdById    String
 
-  /// Номер акта, наприклад "0001" або "2026-01-001"
   number     String
-  /// Необовʼязкова назва, наприклад "Акт наданих послуг за січень"
   title      String?
-  /// Період, за який складено акт
   periodFrom DateTime?
   periodTo   DateTime?
 
-  /// Загальна сума за актом
   total    Decimal @db.Decimal(18, 2)
   currency String  @default("UAH")
 
   status ActStatus @default(DRAFT)
   notes  String?
 
-  /// Опційний звʼязок з інвойсом, з якого взяли позиції/суму
   relatedInvoiceId String?
   relatedInvoice   Invoice? @relation(fields: [relatedInvoiceId], references: [id])
 
-  /// PDF-документ, згенерований для цього акта
   pdfDocumentId String?   @unique
   pdfDocument   Document? @relation("ActDocument", fields: [pdfDocumentId], references: [id])
 
@@ -523,6 +522,10 @@ model Act {
   organization Organization @relation(fields: [organizationId], references: [id])
   client       Client       @relation(fields: [clientId], references: [id])
   createdBy    User         @relation(fields: [createdById], references: [id])
+
+  @@unique([organizationId, number])
+  @@index([organizationId, createdAt])
+  @@index([relatedInvoiceId])
 }
 
 // ===== TODO календар =====
