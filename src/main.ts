@@ -8,7 +8,8 @@ async function bootstrap() {
   const allowedOrigins = [
     'http://localhost:3001', // локальний фронт (якщо використовуєш)
     'http://localhost:3000', // Next dev
-    'https://pda-fe-dev-3883128e3ffd.herokuapp.com', // Heroku фронт
+    'https://pda-fe-dev-3883128e3ffd.herokuapp.com',
+    'https://dev.spravly.com',
   ];
 
   app.enableCors({
