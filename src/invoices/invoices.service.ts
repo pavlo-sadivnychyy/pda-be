@@ -9,10 +9,16 @@ import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
 import { InvoiceStatus, Prisma } from '@prisma/client';
+import { EmailService } from '../email/email.service';
+import { InvoicePdfService } from './invoice-pdf.service';
 
 @Injectable()
 export class InvoicesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly email: EmailService,
+    private readonly invoicePdf: InvoicePdfService,
+  ) {}
 
   private parseDate(dateStr?: string): Date | undefined {
     if (!dateStr) return undefined;
@@ -32,6 +38,129 @@ export class InvoicesService {
       Array.isArray(e.meta.target) &&
       e.meta.target.includes('number')
     );
+  }
+
+  async sendInvoiceByEmail(id: string, variant: 'ua' | 'international' = 'ua') {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        organization: true,
+        client: true,
+        items: true,
+        pdfDocument: true,
+        pdfInternationalDocument: true,
+      },
+    });
+
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    if (
+      invoice.status === InvoiceStatus.PAID ||
+      invoice.status === InvoiceStatus.CANCELLED
+    ) {
+      throw new BadRequestException(
+        `Не можна відправити інвойс зі статусом ${invoice.status}`,
+      );
+    }
+
+    if (!invoice.client || !invoice.client.email) {
+      throw new BadRequestException(
+        'Client email is empty. Fill client.email first.',
+      );
+    }
+
+    const to = invoice.client.email.trim();
+    const orgName = invoice.organization?.name || 'Your company';
+
+    const appUrl = (
+      process.env.APP_PUBLIC_URL || 'http://localhost:3000'
+    ).replace(/\/$/, '');
+    const invoiceUrl = `${appUrl}/invoices/${invoice.id}`;
+
+    // ===== PDF variant =====
+    const isUa = variant === 'ua';
+
+    const { pdfBuffer } = isUa
+      ? await this.invoicePdf.getOrCreatePdfForInvoiceUa(invoice.id)
+      : await this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoice.id);
+
+    const money = (v: any) => {
+      if (v == null) return '0.00';
+      if (typeof v === 'number') return v.toFixed(2);
+      if (typeof v === 'string') {
+        const n = parseFloat(v);
+        return Number.isFinite(n) ? n.toFixed(2) : v;
+      }
+      // Prisma.Decimal
+      // @ts-ignore
+      if (v && typeof v.toNumber === 'function') return v.toNumber().toFixed(2);
+      return String(v);
+    };
+
+    const totalStr = `${money(invoice.total)} ${invoice.currency || 'UAH'}`;
+
+    const subject = isUa
+      ? `Рахунок-фактура ${invoice.number} від ${orgName}`
+      : `Invoice ${invoice.number} from ${orgName}`;
+
+    const greeting = invoice.client.contactName || invoice.client.name || '';
+
+    const title = isUa ? 'Рахунок-фактура' : 'Invoice';
+    const viewLabel = isUa ? 'Переглянути інвойс' : 'View invoice';
+    const pdfName = isUa
+      ? `invoice-ua-${invoice.number}.pdf`
+      : `invoice-int-${invoice.number}.pdf`;
+
+    const html = `
+    <div style="font-family: Arial, sans-serif; color: #111827;">
+      <h2>${title}</h2>
+      <p>${isUa ? 'Вітаємо' : 'Hello'} ${greeting},</p>
+
+      <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
+        <div><b>${isUa ? 'Інвойс' : 'Invoice'}:</b> ${invoice.number}</div>
+        <div><b>${isUa ? 'Сума' : 'Total'}:</b> ${totalStr}</div>
+      </div>
+
+      <p style="margin-top:16px;">
+        ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
+      </p>
+
+      <a href="${invoiceUrl}" style="display:inline-block;padding:10px 14px;background:#111827;color:white;border-radius:999px;text-decoration:none;">
+        ${viewLabel}
+      </a>
+
+      <p style="margin-top:16px;font-size:12px;color:#6b7280;">
+        Sent from ${orgName}
+      </p>
+    </div>
+  `;
+
+    await this.email.sendMail({
+      to,
+      subject,
+      html,
+      text: `${title} ${invoice.number}\nTotal: ${totalStr}\n${invoiceUrl}`,
+      attachments: [
+        {
+          filename: pdfName,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    // ✅ статус + дата відправки
+    return this.prisma.invoice.update({
+      where: { id },
+      data: {
+        status: InvoiceStatus.SENT,
+        sentAt: new Date(),
+      },
+      include: {
+        items: true,
+        client: true,
+      },
+    });
   }
 
   private async generateInvoiceNumber(organizationId: string): Promise<string> {

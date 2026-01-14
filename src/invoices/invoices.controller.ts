@@ -83,8 +83,14 @@ export class InvoicesController {
   }
 
   @Post(':id/send')
-  async send(@Param('id') id: string) {
-    const invoice = await this.invoicesService.send(id);
+  async send(
+    @Param('id') id: string,
+    @Query('variant') variant?: 'ua' | 'international',
+  ) {
+    const invoice = await this.invoicesService.sendInvoiceByEmail(
+      id,
+      variant ?? 'ua',
+    );
     return { invoice };
   }
 

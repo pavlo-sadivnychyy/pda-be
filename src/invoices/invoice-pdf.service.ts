@@ -37,6 +37,16 @@ export class InvoicePdfService {
     return s.replace(/(.{4})/g, '$1 ').trim();
   }
 
+  // ✅ avoid TS type issues with pdfkit import
+  private ensureSpace(doc: any, neededPx: number) {
+    const bottomY = doc.page.height - doc.page.margins.bottom;
+    if (doc.y + neededPx > bottomY) {
+      doc.addPage();
+      doc.x = doc.page.margins.left;
+      doc.y = doc.page.margins.top;
+    }
+  }
+
   // ===========================
   // ===== UA PDF TEMPLATE =====
   // ===========================
@@ -210,7 +220,7 @@ export class InvoicePdfService {
         .fontSize(12)
         .text(`До оплати: ${totalStr} ${invoice.currency}`, { align: 'right' });
 
-      doc.moveDown(2);
+      doc.moveDown(1.4);
 
       if (invoice.notes) {
         doc
@@ -222,6 +232,59 @@ export class InvoicePdfService {
           .fontSize(9)
           .text(invoice.notes);
       }
+
+      // =========================
+      // ✅ Payment details (UA) — рівний блок справа
+      // =========================
+      doc.moveDown(1.2);
+
+      const org = invoice.organization ?? {};
+      const left = doc.page.margins.left;
+      const right = doc.page.margins.right;
+      const usableWidth = doc.page.width - left - right;
+
+      const colWidth = 300; // трохи вужче
+      const colXRight = left + usableWidth - colWidth + 18; // зсув вправо
+
+      this.ensureSpace(doc, 150);
+
+      const blockY = doc.y;
+
+      doc.font('BodyBold').fontSize(11);
+      doc.text('Реквізити для оплати', colXRight, blockY, {
+        width: colWidth,
+        align: 'left',
+        lineBreak: false,
+      });
+
+      const titleWidth = doc.widthOfString('Реквізити для оплати');
+      const underlineY = doc.y + 2;
+      doc
+        .moveTo(colXRight, underlineY)
+        .lineTo(colXRight + titleWidth, underlineY)
+        .stroke();
+
+      doc.y = underlineY + 10;
+
+      const receiver = org.beneficiaryName || org.legalName || org.name || '—';
+
+      const lines: string[] = [];
+      lines.push(`Отримувач: ${receiver}`);
+      if (org.iban) lines.push(`IBAN: ${this.formatIban(org.iban)}`);
+      if (org.bankName) lines.push(`Банк: ${org.bankName}`);
+      if (org.registrationNumber)
+        lines.push(`ЄДРПОУ: ${org.registrationNumber}`);
+      if (org.vatId) lines.push(`ІПН / VAT: ${org.vatId}`);
+      if (org.legalAddress) lines.push(`Юр. адреса: ${org.legalAddress}`);
+      lines.push(
+        `Призначення: ${org.paymentReferenceHint?.trim() || 'Оплата'}`,
+      );
+
+      doc.font('Body').fontSize(10);
+      doc.text(lines.join('\n'), colXRight, doc.y, {
+        width: colWidth,
+        align: 'left',
+      });
 
       doc.end();
     });
@@ -256,7 +319,6 @@ export class InvoicePdfService {
       doc.font('BodyBold').fontSize(28).text('INVOICE', { align: 'left' });
       doc.moveDown(0.8);
 
-      // ===== Seller (left column)
       const sellerX = left;
       const sellerY = doc.y;
 
@@ -279,7 +341,6 @@ export class InvoicePdfService {
 
       const sellerEndY = doc.y;
 
-      // ===== Right block (invoice meta) — IMPORTANT: do NOT use x=0
       const issueDate = invoice.issueDate
         ? invoice.issueDate.toISOString().slice(0, 10)
         : '-';
@@ -305,11 +366,9 @@ export class InvoicePdfService {
         2 +
         doc.heightOfString(rightText, { width: usableWidth, align: 'right' });
 
-      // ✅ Reset cursor to normal left margin so Buyer won't "shift"
       doc.x = left;
       doc.y = Math.max(sellerEndY, rightEndY) + 18;
 
-      // ===== Buyer
       doc.font('BodyBold').fontSize(11).text('Buyer', { underline: true });
       doc.moveDown(0.3);
       doc.font('Body').fontSize(11);
@@ -332,7 +391,6 @@ export class InvoicePdfService {
 
       doc.moveDown(1.2);
 
-      // ===== Table
       const tableTop = doc.y + 10;
       const col = {
         desc: left,
@@ -409,7 +467,6 @@ export class InvoicePdfService {
 
       doc.moveDown(1.2);
 
-      // ===== Totals
       const subtotalStr = this.formatMoney(invoice.subtotal);
       const taxAmountStr = this.formatMoney(invoice.taxAmount ?? 0);
       const totalStr = this.formatMoney(invoice.total);
@@ -442,13 +499,7 @@ export class InvoicePdfService {
         });
       doc.text(`${totalStr} ${invoice.currency}`, { align: 'right' });
 
-      // ===== Payment details (2 columns)
       doc.moveDown(1.6);
-      doc
-        .font('BodyBold')
-        .fontSize(11)
-        .text('Payment details', { underline: true });
-      doc.moveDown(0.5);
 
       const leftColumn = [
         `Beneficiary: ${org.beneficiaryName || org.legalName || org.name || '—'}`,
@@ -469,17 +520,27 @@ export class InvoicePdfService {
       ].filter(Boolean) as string[];
 
       const startY = doc.y;
-      const colWidth = usableWidth / 2 - 10;
 
+      // ширина блоку реквізитів
+      const colWidth = 260;
+
+      // X позиція правого блоку — зсунута ближче до правого краю
+      const colXRight = left + usableWidth - colWidth + 18;
+
+      // заголовок тепер теж вирівняний під блок
+      doc
+        .font('BodyBold')
+        .fontSize(11)
+        .text('Payment details', colXRight, startY - 16, { underline: true });
+
+      // сам блок реквізитів одним стовпчиком
       doc.font('Body').fontSize(9);
-      doc.text(leftColumn.join('\n'), left, startY, { width: colWidth });
-      doc.text(rightColumn.join('\n'), left + colWidth + 20, startY, {
+      doc.text([...leftColumn, ...rightColumn].join('\n'), colXRight, startY, {
         width: colWidth,
       });
 
       doc.moveDown(6);
 
-      // ===== Notes
       doc.font('BodyBold').fontSize(11).text('Notes', { underline: true });
       doc.moveDown(0.3);
       doc
@@ -614,17 +675,13 @@ export class InvoicePdfService {
 
       const updated = await this.prisma.invoice.findUnique({
         where: { id: invoiceId },
-        include: {
-          pdfDocument: true,
-          pdfInternationalDocument: true,
-        },
+        include: { pdfDocument: true, pdfInternationalDocument: true },
       });
 
       const document =
         kind === 'UA'
           ? updated?.pdfDocument
           : updated?.pdfInternationalDocument;
-
       if (!document)
         throw new NotFoundException('PDF-документ для інвойсу не знайдено');
 
@@ -640,7 +697,6 @@ export class InvoicePdfService {
 
     const document =
       kind === 'UA' ? invoice.pdfDocument : invoice.pdfInternationalDocument;
-
     if (!document)
       throw new NotFoundException('PDF-документ для інвойсу не знайдено');
 
