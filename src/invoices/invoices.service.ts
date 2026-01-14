@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -20,6 +21,17 @@ export class InvoicesService {
       throw new BadRequestException(`Невалідна дата: ${dateStr}`);
     }
     return d;
+  }
+
+  private isUniqueNumberError(e: any): boolean {
+    // Prisma P2002: Unique constraint failed
+    return (
+      e &&
+      e.code === 'P2002' &&
+      e.meta &&
+      Array.isArray(e.meta.target) &&
+      e.meta.target.includes('number')
+    );
   }
 
   private async generateInvoiceNumber(organizationId: string): Promise<string> {
@@ -101,6 +113,10 @@ export class InvoicesService {
    * ✅ Create invoice:
    * - createdByAuthUserId приходить з Clerk guard (req.authUserId)
    * - мапимо його на нашого User.id
+   *
+   * ✅ FIX:
+   * - number унікальний тепер в межах organizationId
+   * - додано ретрай на P2002, якщо 2 запити одночасно згенерили однаковий number
    */
   async create(dto: CreateInvoiceDto, createdByAuthUserId: string) {
     const {
@@ -122,7 +138,6 @@ export class InvoicesService {
       throw new BadRequestException('auth user id is required');
     }
 
-    // ✅ знайти твого user в БД по Clerk authUserId
     const createdByUser = await this.prisma.user.findUnique({
       where: { authUserId: createdByAuthUserId },
       select: { id: true },
@@ -141,47 +156,70 @@ export class InvoicesService {
     const issueDateParsed = this.parseDate(issueDate) ?? new Date();
     const dueDateParsed = this.parseDate(dueDate);
 
-    const number = await this.generateInvoiceNumber(organizationId);
     const { subtotal, taxAmount, total, lineTotals } =
       this.calculateTotals(items);
 
-    return this.prisma.invoice.create({
-      data: {
-        organizationId,
-        createdById: createdByUser.id, // ✅ твій User.id
-        clientId: clientId ?? null,
-        number,
-        issueDate: issueDateParsed,
-        dueDate: dueDateParsed ?? null,
-        currency: currency ?? 'UAH',
+    // ✅ Ретрай: якщо два запити одночасно створили один номер — пробуємо ще раз
+    const maxAttempts = 3;
+    let lastError: any = null;
 
-        subtotal,
-        taxAmount,
-        total,
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const number = await this.generateInvoiceNumber(organizationId);
 
-        status: status ?? InvoiceStatus.DRAFT,
-        notes: notes ?? null,
+      try {
+        return await this.prisma.invoice.create({
+          data: {
+            organizationId,
+            createdById: createdByUser.id,
+            clientId: clientId ?? null,
 
-        // нові поля
-        sentAt: null,
-        paidAt: null,
+            number,
+            issueDate: issueDateParsed,
+            dueDate: dueDateParsed ?? null,
 
-        items: {
-          create: items.map((item: any, index: number) => ({
-            name: item.name,
-            description: item.description ?? null,
-            quantity: item.quantity,
-            unitPrice: item.unitPrice,
-            taxRate: item.taxRate ?? null,
-            lineTotal: lineTotals[index].lineTotal,
-          })),
-        },
-      },
-      include: {
-        items: true,
-        client: true,
-      },
-    });
+            currency: currency ?? 'UAH',
+            status: status ?? InvoiceStatus.DRAFT,
+            notes: notes ?? null,
+
+            subtotal,
+            taxAmount,
+            total,
+
+            sentAt: null,
+            paidAt: null,
+
+            items: {
+              create: items.map((item: any, index: number) => ({
+                name: item.name,
+                description: item.description ?? null,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                taxRate: item.taxRate ?? null,
+                lineTotal: lineTotals[index].lineTotal,
+              })),
+            },
+          },
+          include: {
+            items: true,
+            client: true,
+          },
+        });
+      } catch (e: any) {
+        lastError = e;
+
+        // якщо номер уже зайнятий — повторюємо
+        if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
+          continue;
+        }
+
+        // інші помилки — кидаємо як є
+        throw e;
+      }
+    }
+
+    throw new InternalServerErrorException(
+      `Не вдалося створити інвойс через конфлікт нумерації (P2002). Спробуйте ще раз.`,
+    );
   }
 
   async findAll(params: {
@@ -271,6 +309,7 @@ export class InvoicesService {
         total: tt,
         lineTotals,
       } = this.calculateTotals(dto.items!);
+
       subtotal = s as any;
       taxAmount = t as any;
       total = tt as any;
@@ -335,8 +374,6 @@ export class InvoicesService {
       where: { id },
     });
   }
-
-  // ============ НОВІ МЕТОДИ ЖИТТЄВОГО ЦИКЛУ ============
 
   async send(id: string) {
     const invoice = await this.prisma.invoice.findUnique({
@@ -448,7 +485,6 @@ export class InvoicesService {
     const parsedFrom = from ? this.parseDate(from) : undefined;
     const parsedTo = to ? this.parseDate(to) : undefined;
 
-    // За замовчуванням — останні 6 місяців
     const dateFrom =
       parsedFrom ?? new Date(now.getFullYear(), now.getMonth() - 5, 1);
     const dateTo = parsedTo ?? now;
@@ -477,10 +513,7 @@ export class InvoicesService {
         const n = parseFloat(v);
         return isNaN(n) ? 0 : n;
       }
-      // Prisma.Decimal
-      // @ts-ignore
       if (v && typeof v.toNumber === 'function') {
-        // @ts-ignore
         return v.toNumber();
       }
       return 0;
@@ -501,7 +534,7 @@ export class InvoicesService {
     const getMonthKey = (d: Date) => {
       const y = d.getFullYear();
       const m = d.getMonth() + 1;
-      return `${y}-${m.toString().padStart(2, '0')}`; // 2026-01
+      return `${y}-${m.toString().padStart(2, '0')}`;
     };
 
     let currency: string | null = null;
@@ -510,28 +543,20 @@ export class InvoicesService {
       const amount = toNumber(inv.total);
       currency = currency || inv.currency || null;
 
-      // Загальні суми
-      if (inv.status === InvoiceStatus.PAID) {
-        totalPaid += amount;
-      }
+      if (inv.status === InvoiceStatus.PAID) totalPaid += amount;
       if (
         inv.status === InvoiceStatus.SENT ||
         inv.status === InvoiceStatus.OVERDUE
-      ) {
+      )
         totalOutstanding += amount;
-      }
-      if (inv.status === InvoiceStatus.OVERDUE) {
-        totalOverdue += amount;
-      }
+      if (inv.status === InvoiceStatus.OVERDUE) totalOverdue += amount;
 
-      // Виставлено по місяцях (issueDate)
       const issueKey = getMonthKey(inv.issueDate);
       if (!monthMap.has(issueKey)) {
         monthMap.set(issueKey, { issuedTotal: 0, paidTotal: 0 });
       }
       monthMap.get(issueKey)!.issuedTotal += amount;
 
-      // Оплачено по місяцях (paidAt, якщо є)
       if (inv.status === InvoiceStatus.PAID && inv.paidAt) {
         const paidKey = getMonthKey(inv.paidAt);
         if (!monthMap.has(paidKey)) {
@@ -543,7 +568,7 @@ export class InvoicesService {
 
     const monthly = Array.from(monthMap.entries())
       .map(([month, v]) => ({
-        month, // '2026-01'
+        month,
         issuedTotal: v.issuedTotal,
         paidTotal: v.paidTotal,
       }))

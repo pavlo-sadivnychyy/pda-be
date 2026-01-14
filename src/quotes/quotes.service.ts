@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { Prisma, QuoteStatus, InvoiceStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -24,6 +25,17 @@ export class QuotesService {
     if (isNaN(d.getTime()))
       throw new BadRequestException(`Invalid date: ${dateStr}`);
     return d;
+  }
+
+  private isUniqueNumberError(e: any): boolean {
+    // Prisma P2002: Unique constraint failed
+    return (
+      e &&
+      e.code === 'P2002' &&
+      e.meta &&
+      Array.isArray(e.meta.target) &&
+      e.meta.target.includes('number')
+    );
   }
 
   private calculateTotals(
@@ -100,45 +112,66 @@ export class QuotesService {
       throw new BadRequestException('items are required');
     }
 
-    const number = await this.generateQuoteNumber(organizationId);
     const issueDateParsed = this.parseDate(issueDate) ?? new Date();
     const validUntilParsed = this.parseDate(validUntil);
 
     const calc = this.calculateTotals(items);
 
-    return this.prisma.quote.create({
-      data: {
-        organizationId,
-        createdById,
-        clientId: clientId ?? null,
-        number,
-        issueDate: issueDateParsed,
-        validUntil: validUntilParsed ?? null,
-        currency: currency ?? 'USD',
-        status: status ?? QuoteStatus.DRAFT,
-        notes: notes ?? null,
+    // ✅ Ретрай на P2002 (конфлікт number при паралельних запитах)
+    const maxAttempts = 3;
+    let lastError: any = null;
 
-        subtotal: calc.subtotal,
-        taxAmount: calc.taxAmount,
-        total: calc.total,
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const number = await this.generateQuoteNumber(organizationId);
 
-        sentAt: null,
-        lastEmailedTo: null,
-        emailMessageId: null,
+      try {
+        return await this.prisma.quote.create({
+          data: {
+            organizationId,
+            createdById,
+            clientId: clientId ?? null,
+            number,
+            issueDate: issueDateParsed,
+            validUntil: validUntilParsed ?? null,
+            currency: currency ?? 'USD',
+            status: status ?? QuoteStatus.DRAFT,
+            notes: notes ?? null,
 
-        items: {
-          create: items.map((it, idx) => ({
-            name: it.name,
-            description: it.description ?? null,
-            quantity: it.quantity,
-            unitPrice: it.unitPrice,
-            taxRate: it.taxRate ?? null,
-            lineTotal: calc.lineTotals[idx].lineTotal,
-          })),
-        },
-      },
-      include: { items: true, client: true, organization: true },
-    });
+            subtotal: calc.subtotal,
+            taxAmount: calc.taxAmount,
+            total: calc.total,
+
+            sentAt: null,
+            lastEmailedTo: null,
+            emailMessageId: null,
+
+            items: {
+              create: items.map((it, idx) => ({
+                name: it.name,
+                description: it.description ?? null,
+                quantity: it.quantity,
+                unitPrice: it.unitPrice,
+                taxRate: it.taxRate ?? null,
+                lineTotal: calc.lineTotals[idx].lineTotal,
+              })),
+            },
+          },
+          include: { items: true, client: true, organization: true },
+        });
+      } catch (e: any) {
+        lastError = e;
+
+        if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
+          continue;
+        }
+
+        throw e;
+      }
+    }
+
+    throw new InternalServerErrorException(
+      'Не вдалося створити quote через конфлікт нумерації (P2002). Спробуйте ще раз.',
+    );
   }
 
   async findAll(params: {
@@ -269,7 +302,6 @@ export class QuotesService {
     });
   }
 
-  // ✅ SEND EMAIL + PDF attachment
   async sendQuoteByEmail(id: string) {
     const quote = await this.prisma.quote.findUnique({
       where: { id },
@@ -299,7 +331,6 @@ export class QuotesService {
     ).replace(/\/$/, '');
     const quoteUrl = `${appUrl}/quotes/${quote.id}`;
 
-    // ✅ PDF (create or get)
     const { pdfBuffer } = await this.quotePdf.getOrCreatePdfForQuote(id);
 
     const money = (v: any) => {
@@ -379,12 +410,17 @@ export class QuotesService {
     });
     if (!quote) throw new NotFoundException('Quote not found');
 
+    // ⚠️ Тут може бути конфлікт, якщо вдруге конвертнути або якщо такий номер вже існує.
+    // Мінімально-безпечний варіант: додати суфікс -<last4 of quoteId>
+    const safeSuffix = quoteId.slice(-4).toUpperCase();
+    const invoiceNumber = `INV-CONV-${quote.number}-${safeSuffix}`;
+
     const invoice = await this.prisma.invoice.create({
       data: {
         organizationId: quote.organizationId,
         createdById: quote.createdById,
         clientId: quote.clientId,
-        number: `INV-CONV-${quote.number}`,
+        number: invoiceNumber,
         issueDate: new Date(),
         dueDate: null,
         currency: quote.currency || 'USD',
