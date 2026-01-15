@@ -12,6 +12,7 @@ import { InvoicesModule } from './invoices/invoices.module';
 import { ClientsModule } from './clients/clients.module';
 import { ActsModule } from './acts/acts.module';
 import { QuotesModule } from './quotes/quotes.module';
+import { ActivityModule } from './activity/activity.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { QuotesModule } from './quotes/quotes.module';
     ActsModule,
     QuotesModule,
     InvoicesModule,
+    ActivityModule,
     ConfigModule.forRoot({ isGlobal: true }),
   ],
   controllers: [AppController],

@@ -5,9 +5,14 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ActStatus } from '@prisma/client';
+import {
+  ActStatus,
+  ActivityEntityType,
+  ActivityEventType,
+} from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { ActPdfService } from './act-pdf.service';
+import { ActivityService } from '../activity/activity.service';
 
 type CreateActFromInvoiceInput = {
   invoiceId: string;
@@ -25,6 +30,7 @@ export class ActsService {
     private readonly prisma: PrismaService,
     private readonly email: EmailService,
     private readonly actPdf: ActPdfService,
+    private readonly activity: ActivityService,
   ) {}
 
   private isUniqueActNumberError(e: any): boolean {
@@ -37,7 +43,6 @@ export class ActsService {
     );
   }
 
-  // ✅ clerk authUserId -> db userId (User.id)
   private async resolveDbUserId(authUserId: string): Promise<string> {
     if (!authUserId) throw new BadRequestException('Missing auth user');
 
@@ -55,7 +60,6 @@ export class ActsService {
     return user.id;
   }
 
-  // ✅ доступ до організації
   private async assertOrgAccess(dbUserId: string, organizationId: string) {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
@@ -68,6 +72,28 @@ export class ActsService {
     if (!membership) {
       throw new BadRequestException('No access to this organization');
     }
+  }
+
+  private async logStatusChange(params: {
+    organizationId: string;
+    actorUserId: string;
+    actId: string;
+    from: any;
+    to: any;
+    meta?: any;
+  }) {
+    if (String(params.from) === String(params.to)) return;
+
+    await this.activity.create({
+      organizationId: params.organizationId,
+      actorUserId: params.actorUserId,
+      entityType: ActivityEntityType.ACT,
+      entityId: params.actId,
+      eventType: ActivityEventType.STATUS_CHANGED,
+      fromStatus: String(params.from),
+      toStatus: String(params.to),
+      meta: params.meta ?? undefined,
+    });
   }
 
   async createFromInvoice(input: CreateActFromInvoiceInput) {
@@ -86,7 +112,6 @@ export class ActsService {
       throw new BadRequestException('Поле number (номер акта) є обовʼязковим');
     }
 
-    // 1) знайти юзера по Clerk authUserId
     const createdByUser = await this.prisma.user.findUnique({
       where: { authUserId: createdByAuthUserId },
       select: { id: true },
@@ -96,7 +121,6 @@ export class ActsService {
       throw new NotFoundException('User not found (sync user first)');
     }
 
-    // 2) підтягнути invoice
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
       include: { client: true, organization: true },
@@ -110,7 +134,6 @@ export class ActsService {
       );
     }
 
-    // ✅ 3) перевірка на дубль номера В МЕЖАХ ОРГАНІЗАЦІЇ
     const existingByNumber = await this.prisma.act.findFirst({
       where: {
         organizationId: invoice.organizationId,
@@ -125,7 +148,6 @@ export class ActsService {
       );
     }
 
-    // 4) create
     try {
       const act = await this.prisma.act.create({
         data: {
@@ -141,6 +163,19 @@ export class ActsService {
           notes: notes ?? '',
           relatedInvoiceId: invoice.id,
           status: 'DRAFT',
+        },
+      });
+
+      await this.activity.create({
+        organizationId: act.organizationId,
+        actorUserId: createdByUser.id,
+        entityType: ActivityEntityType.ACT,
+        entityId: act.id,
+        eventType: ActivityEventType.CREATED,
+        meta: {
+          actNumber: act.number,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.number,
         },
       });
 
@@ -192,7 +227,6 @@ export class ActsService {
     return { act };
   }
 
-  // ✅ NEW: send act to client email with PDF attached
   async sendActByEmail(authUserId: string, actId: string) {
     const dbUserId = await this.resolveDbUserId(authUserId);
 
@@ -225,7 +259,6 @@ export class ActsService {
     const to = act.client.email.trim();
     const orgName = act.organization?.name || 'Your company';
 
-    // ✅ PDF у вкладенні
     const { pdfBuffer } = await this.actPdf.getOrCreatePdfForAct(act.id);
 
     const safeNumber = String(act.number).replace(/[^a-zA-Z0-9\-]/g, '_');
@@ -251,7 +284,6 @@ export class ActsService {
               ? `<div><b>Інвойс:</b> № ${act.relatedInvoice.number}</div>`
               : ''
           }
-          <div><b>Сума:</b> ${String(act.total)} ${act.currency || ''}</div>
         </div>
 
         <p style="margin-top:16px;">
@@ -278,11 +310,31 @@ export class ActsService {
       ],
     });
 
-    // ✅ оновлюємо статус на SENT
+    const beforeStatus = act.status;
+
     const updated = await this.prisma.act.update({
       where: { id: actId },
       data: { status: ActStatus.SENT },
       include: { client: true, relatedInvoice: true },
+    });
+
+    await this.activity.create({
+      organizationId: act.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.ACT,
+      entityId: act.id,
+      eventType: ActivityEventType.SENT,
+      toEmail: to,
+      meta: { actNumber: act.number, subject },
+    });
+
+    await this.logStatusChange({
+      organizationId: act.organizationId,
+      actorUserId: dbUserId,
+      actId: act.id,
+      from: beforeStatus,
+      to: ActStatus.SENT,
+      meta: { via: 'sendActByEmail' },
     });
 
     return { act: updated };

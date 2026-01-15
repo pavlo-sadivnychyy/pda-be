@@ -5,9 +5,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { EmailModule } from '../email/email.module';
+import { ActivityModule } from '../activity/activity.module';
 
 @Module({
-  imports: [EmailModule],
+  imports: [EmailModule, ActivityModule],
   controllers: [InvoicesController],
   providers: [
     InvoicesService,

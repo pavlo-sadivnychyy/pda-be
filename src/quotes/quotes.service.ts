@@ -4,12 +4,19 @@ import {
   NotFoundException,
   InternalServerErrorException,
 } from '@nestjs/common';
-import { Prisma, QuoteStatus, InvoiceStatus } from '@prisma/client';
+import {
+  Prisma,
+  QuoteStatus,
+  InvoiceStatus,
+  ActivityEntityType,
+  ActivityEventType,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
 import { CreateQuoteDto } from './dto/create-quote.dto';
 import { UpdateQuoteDto } from './dto/update-quote.dto';
 import { QuotePdfService } from './quote-pdf.service';
+import { ActivityService } from '../activity/activity.service';
 
 @Injectable()
 export class QuotesService {
@@ -17,7 +24,65 @@ export class QuotesService {
     private readonly prisma: PrismaService,
     private readonly email: EmailService,
     private readonly quotePdf: QuotePdfService,
+    private readonly activity: ActivityService,
   ) {}
+
+  // =========================
+  // ✅ AUTH/ORG HELPERS
+  // =========================
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
+  private async assertOrgAccess(dbUserId: string, organizationId: string) {
+    if (!organizationId)
+      throw new BadRequestException('organizationId is required');
+
+    const membership = await this.prisma.userOrganization.findUnique({
+      where: { userId_organizationId: { userId: dbUserId, organizationId } },
+      select: { id: true },
+    });
+
+    if (!membership) {
+      throw new BadRequestException('No access to this organization');
+    }
+  }
+
+  private async logStatusChange(params: {
+    organizationId: string;
+    actorUserId: string;
+    entityType: ActivityEntityType;
+    entityId: string;
+    from: any;
+    to: any;
+    meta?: any;
+  }) {
+    if (String(params.from) === String(params.to)) return;
+
+    await this.activity.create({
+      organizationId: params.organizationId,
+      actorUserId: params.actorUserId,
+      entityType: params.entityType,
+      entityId: params.entityId,
+      eventType: ActivityEventType.STATUS_CHANGED,
+      fromStatus: String(params.from),
+      toStatus: String(params.to),
+      meta: params.meta ?? undefined,
+    });
+  }
 
   private parseDate(dateStr?: string): Date | undefined {
     if (!dateStr) return undefined;
@@ -28,7 +93,6 @@ export class QuotesService {
   }
 
   private isUniqueNumberError(e: any): boolean {
-    // Prisma P2002: Unique constraint failed
     return (
       e &&
       e.code === 'P2002' &&
@@ -90,6 +154,9 @@ export class QuotesService {
     return `${prefix}${String(nextSeq).padStart(4, '0')}`;
   }
 
+  // =========================
+  // ✅ CRUD
+  // =========================
   async create(dto: CreateQuoteDto) {
     const {
       organizationId,
@@ -117,15 +184,13 @@ export class QuotesService {
 
     const calc = this.calculateTotals(items);
 
-    // ✅ Ретрай на P2002 (конфлікт number при паралельних запитах)
     const maxAttempts = 3;
-    let lastError: any = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const number = await this.generateQuoteNumber(organizationId);
 
       try {
-        return await this.prisma.quote.create({
+        const quote = await this.prisma.quote.create({
           data: {
             organizationId,
             createdById,
@@ -158,13 +223,22 @@ export class QuotesService {
           },
           include: { items: true, client: true, organization: true },
         });
-      } catch (e: any) {
-        lastError = e;
 
+        // ✅ Activity: CREATED
+        await this.activity.create({
+          organizationId: quote.organizationId,
+          actorUserId: createdById,
+          entityType: ActivityEntityType.QUOTE,
+          entityId: quote.id,
+          eventType: ActivityEventType.CREATED,
+          meta: { quoteNumber: quote.number },
+        });
+
+        return quote;
+      } catch (e: any) {
         if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
           continue;
         }
-
         throw e;
       }
     }
@@ -216,6 +290,7 @@ export class QuotesService {
     const issueDateParsed = dto.issueDate
       ? this.parseDate(dto.issueDate)
       : undefined;
+
     const validUntilParsed =
       dto.validUntil === null
         ? null
@@ -288,11 +363,20 @@ export class QuotesService {
     await this.prisma.quote.delete({ where: { id } });
   }
 
-  async markStatus(id: string, status: QuoteStatus) {
+  // =========================
+  // ✅ STATUS
+  // =========================
+  async markStatus(authUserId: string, id: string, status: QuoteStatus) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const quote = await this.prisma.quote.findUnique({ where: { id } });
     if (!quote) throw new NotFoundException('Quote not found');
 
-    return this.prisma.quote.update({
+    await this.assertOrgAccess(dbUserId, quote.organizationId);
+
+    const before = quote.status;
+
+    const updated = await this.prisma.quote.update({
       where: { id },
       data: {
         status,
@@ -300,9 +384,26 @@ export class QuotesService {
       },
       include: { client: true, items: true },
     });
+
+    await this.logStatusChange({
+      organizationId: updated.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.QUOTE,
+      entityId: updated.id,
+      from: before,
+      to: status,
+      meta: { quoteNumber: updated.number, via: 'markStatus' },
+    });
+
+    return updated;
   }
 
-  async sendQuoteByEmail(id: string) {
+  // =========================
+  // ✅ SEND EMAIL
+  // =========================
+  async sendQuoteByEmail(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const quote = await this.prisma.quote.findUnique({
       where: { id },
       include: {
@@ -314,6 +415,8 @@ export class QuotesService {
     });
 
     if (!quote) throw new NotFoundException('Quote not found');
+
+    await this.assertOrgAccess(dbUserId, quote.organizationId);
 
     if (!quote.client || !quote.client.email) {
       throw new BadRequestException(
@@ -389,6 +492,8 @@ export class QuotesService {
       ],
     });
 
+    const beforeStatus = quote.status;
+
     const updated = await this.prisma.quote.update({
       where: { id },
       data: {
@@ -400,54 +505,123 @@ export class QuotesService {
       include: { client: true, items: true },
     });
 
+    // ✅ Activity: SENT
+    await this.activity.create({
+      organizationId: quote.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.QUOTE,
+      entityId: quote.id,
+      eventType: ActivityEventType.SENT,
+      toEmail: to,
+      meta: {
+        quoteNumber: quote.number,
+        subject,
+        total: totalStr,
+      },
+    });
+
+    // ✅ Activity: STATUS_CHANGED (якщо реально змінився)
+    await this.logStatusChange({
+      organizationId: quote.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.QUOTE,
+      entityId: quote.id,
+      from: beforeStatus,
+      to: QuoteStatus.SENT,
+      meta: { via: 'sendQuoteByEmail' },
+    });
+
     return updated;
   }
 
-  async convertToInvoice(quoteId: string) {
+  // =========================
+  // ✅ CONVERT TO INVOICE (LOGGING INCLUDED)
+  // =========================
+  async convertToInvoice(authUserId: string, quoteId: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const quote = await this.prisma.quote.findUnique({
       where: { id: quoteId },
       include: { items: true },
     });
     if (!quote) throw new NotFoundException('Quote not found');
 
-    // ⚠️ Тут може бути конфлікт, якщо вдруге конвертнути або якщо такий номер вже існує.
-    // Мінімально-безпечний варіант: додати суфікс -<last4 of quoteId>
+    await this.assertOrgAccess(dbUserId, quote.organizationId);
+
+    // ⚠️ Мінімально-безпечний номер
     const safeSuffix = quoteId.slice(-4).toUpperCase();
     const invoiceNumber = `INV-CONV-${quote.number}-${safeSuffix}`;
 
-    const invoice = await this.prisma.invoice.create({
-      data: {
-        organizationId: quote.organizationId,
-        createdById: quote.createdById,
-        clientId: quote.clientId,
-        number: invoiceNumber,
-        issueDate: new Date(),
-        dueDate: null,
-        currency: quote.currency || 'USD',
-        status: InvoiceStatus.DRAFT,
-        subtotal: quote.subtotal,
-        taxAmount: quote.taxAmount,
-        total: quote.total,
-        notes: quote.notes ?? null,
-        items: {
-          create: quote.items.map((it) => ({
-            name: it.name,
-            description: it.description ?? null,
-            quantity: it.quantity,
-            unitPrice: it.unitPrice as any,
-            taxRate: it.taxRate ?? null,
-            lineTotal: it.lineTotal as any,
-          })),
+    const beforeStatus = quote.status;
+
+    const invoice = await this.prisma.$transaction(async (tx) => {
+      const createdInvoice = await tx.invoice.create({
+        data: {
+          organizationId: quote.organizationId,
+          createdById: dbUserId, // ✅ актор конвертації
+          clientId: quote.clientId,
+          number: invoiceNumber,
+          issueDate: new Date(),
+          dueDate: null,
+          currency: quote.currency || 'USD',
+          status: InvoiceStatus.DRAFT,
+          subtotal: quote.subtotal,
+          taxAmount: quote.taxAmount,
+          total: quote.total,
+          notes: quote.notes ?? null,
+          items: {
+            create: quote.items.map((it) => ({
+              name: it.name,
+              description: it.description ?? null,
+              quantity: it.quantity,
+              unitPrice: it.unitPrice as any,
+              taxRate: it.taxRate ?? null,
+              lineTotal: it.lineTotal as any,
+            })),
+          },
         },
-      },
-      include: { items: true, client: true },
+        include: { items: true, client: true },
+      });
+
+      await tx.quote.update({
+        where: { id: quoteId },
+        data: {
+          status: QuoteStatus.CONVERTED,
+          convertedInvoiceId: createdInvoice.id,
+        },
+      });
+
+      return createdInvoice;
     });
 
-    await this.prisma.quote.update({
-      where: { id: quoteId },
-      data: {
-        status: QuoteStatus.CONVERTED,
+    // ✅ Activity 1: QUOTE status changed -> CONVERTED
+    await this.logStatusChange({
+      organizationId: quote.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.QUOTE,
+      entityId: quote.id,
+      from: beforeStatus,
+      to: QuoteStatus.CONVERTED,
+      meta: {
+        quoteNumber: quote.number,
         convertedInvoiceId: invoice.id,
+        convertedInvoiceNumber: invoice.number,
+        via: 'convertToInvoice',
+      },
+    });
+
+    // ✅ Activity 2: INVOICE created
+    await this.activity.create({
+      organizationId: quote.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.INVOICE,
+      entityId: invoice.id,
+      eventType: ActivityEventType.CREATED,
+      meta: {
+        invoiceNumber: invoice.number,
+        fromQuoteId: quote.id,
+        fromQuoteNumber: quote.number,
+        via: 'convertToInvoice',
       },
     });
 

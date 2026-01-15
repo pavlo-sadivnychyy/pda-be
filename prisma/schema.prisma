@@ -130,6 +130,7 @@ model User {
   acts                 Act[]
   quotes               Quote[]
   invoiceRemindersSent InvoiceReminderLog[] @relation("InvoiceReminderToUser")
+  activityLogs         ActivityLog[]
 }
 
 // ---- Organization ----
@@ -185,6 +186,7 @@ model Organization {
   acts             Act[]
   quotes           Quote[]
   invoiceReminders InvoiceReminderLog[] @relation("InvoiceReminderToOrg")
+  activityLogs     ActivityLog[]
 }
 
 // ---- UserOrganization ----
@@ -592,4 +594,47 @@ model InvoiceReminderLog {
   @@index([organizationId, sentAt])
   @@index([invoiceId, sentAt])
   @@index([invoiceId, kind, sentAt])
+}
+
+enum ActivityEntityType {
+  INVOICE
+  ACT
+  QUOTE
+}
+
+enum ActivityEventType {
+  CREATED
+  STATUS_CHANGED
+  SENT
+  REMINDER_SENT
+}
+
+model ActivityLog {
+  id             String @id @default(cuid())
+  organizationId String
+  actorUserId    String
+
+  entityType ActivityEntityType
+  entityId   String
+
+  eventType ActivityEventType
+
+  // для статусів (SENT/PAID/CANCELLED/etc)
+  fromStatus String?
+  toStatus   String?
+
+  // для email подій
+  toEmail String?
+
+  // додаткові поля на майбутнє (номер документа, сума, будь-що)
+  meta Json?
+
+  createdAt DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  actor        User         @relation(fields: [actorUserId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, createdAt])
+  @@index([organizationId, entityType, entityId, createdAt])
 }

@@ -8,9 +8,15 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 import { MarkInvoicePaidDto } from './dto/mark-invoice-paid.dto';
-import { InvoiceStatus, Prisma } from '@prisma/client';
+import {
+  InvoiceStatus,
+  Prisma,
+  ActivityEntityType,
+  ActivityEventType,
+} from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { InvoicePdfService } from './invoice-pdf.service';
+import { ActivityService } from '../activity/activity.service';
 
 @Injectable()
 export class InvoicesService {
@@ -18,6 +24,7 @@ export class InvoicesService {
     private readonly prisma: PrismaService,
     private readonly email: EmailService,
     private readonly invoicePdf: InvoicePdfService,
+    private readonly activity: ActivityService,
   ) {}
 
   // =========================
@@ -64,7 +71,6 @@ export class InvoicesService {
   }
 
   private isUniqueNumberError(e: any): boolean {
-    // Prisma P2002: Unique constraint failed
     return (
       e &&
       e.code === 'P2002' &&
@@ -74,17 +80,39 @@ export class InvoicesService {
     );
   }
 
+  private async logStatusChange(params: {
+    organizationId: string;
+    actorUserId: string;
+    invoiceId: string;
+    from: any;
+    to: any;
+    meta?: any;
+  }) {
+    if (String(params.from) === String(params.to)) return;
+
+    await this.activity.create({
+      organizationId: params.organizationId,
+      actorUserId: params.actorUserId,
+      entityType: ActivityEntityType.INVOICE,
+      entityId: params.invoiceId,
+      eventType: ActivityEventType.STATUS_CHANGED,
+      fromStatus: String(params.from),
+      toStatus: String(params.to),
+      meta: params.meta ?? undefined,
+    });
+  }
+
   // =========================
   // ✅ DEADLINES: LIST
   // =========================
   async getDueSoonInvoices(params: {
     authUserId: string;
     organizationId: string;
-    minDays?: number; // default 1
-    maxDays?: number; // default 2
-    includeDraft?: boolean; // default false
-    includeOverdue?: boolean; // default false
-    limit?: number; // default 20
+    minDays?: number;
+    maxDays?: number;
+    includeDraft?: boolean;
+    includeOverdue?: boolean;
+    limit?: number;
   }) {
     const {
       authUserId,
@@ -117,7 +145,6 @@ export class InvoicesService {
       notIn: [InvoiceStatus.PAID, InvoiceStatus.CANCELLED],
     };
 
-    // якщо не хочемо DRAFT — виключаємо
     if (!includeDraft) {
       statusFilter.notIn = Array.from(
         new Set([...(statusFilter.notIn ?? []), InvoiceStatus.DRAFT]),
@@ -130,9 +157,6 @@ export class InvoicesService {
       lt: to,
     };
 
-    // якщо треба includeOverdue — тоді показуємо і прострочені
-    // прострочені — це dueDate < from (тобто раніше вікна) або dueDate < сьогодні
-    // але ти просив "1–2 дні" — тож дефолтно false.
     if (includeOverdue) {
       dueWhere.gte = undefined;
       dueWhere.lt = to;
@@ -214,7 +238,6 @@ export class InvoicesService {
       );
     }
 
-    // ✅ анти-спам 12 год (можна force=true)
     const force = Boolean(options?.force);
     if (!force) {
       const last = await this.prisma.invoiceReminderLog.findFirst({
@@ -238,7 +261,6 @@ export class InvoicesService {
     const orgName = invoice.organization?.name || 'Your company';
     const due = invoice.dueDate.toISOString().slice(0, 10);
 
-    // ===== PDF variant =====
     const variant = options?.variant ?? 'ua';
     const isUa = variant === 'ua';
 
@@ -308,6 +330,21 @@ export class InvoicesService {
       } as any,
     });
 
+    // ✅ Activity log
+    await this.activity.create({
+      organizationId: invoice.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.INVOICE,
+      entityId: invoice.id,
+      eventType: ActivityEventType.REMINDER_SENT,
+      toEmail: to,
+      meta: {
+        invoiceNumber: invoice.number,
+        dueDate: due,
+        variant,
+      },
+    });
+
     return { success: true };
   }
 
@@ -351,7 +388,6 @@ export class InvoicesService {
     ).replace(/\/$/, '');
     const invoiceUrl = `${appUrl}/invoices/${invoice.id}`;
 
-    // ===== PDF variant =====
     const isUa = variant === 'ua';
 
     const { pdfBuffer } = isUa
@@ -365,7 +401,6 @@ export class InvoicesService {
         const n = parseFloat(v);
         return Number.isFinite(n) ? n.toFixed(2) : v;
       }
-      // Prisma.Decimal
       // @ts-ignore
       if (v && typeof v.toNumber === 'function') return v.toNumber().toFixed(2);
       return String(v);
@@ -423,8 +458,9 @@ export class InvoicesService {
       ],
     });
 
-    // ✅ статус + дата відправки
-    return this.prisma.invoice.update({
+    const beforeStatus = invoice.status;
+
+    const updated = await this.prisma.invoice.update({
       where: { id },
       data: {
         status: InvoiceStatus.SENT,
@@ -435,6 +471,34 @@ export class InvoicesService {
         client: true,
       },
     });
+
+    // ✅ Activity logs
+    // 1) SENT event
+    await this.activity.create({
+      organizationId: invoice.organizationId,
+      actorUserId: invoice.createdById,
+      entityType: ActivityEntityType.INVOICE,
+      entityId: invoice.id,
+      eventType: ActivityEventType.SENT,
+      toEmail: to,
+      meta: {
+        invoiceNumber: invoice.number,
+        variant,
+        subject,
+      },
+    });
+
+    // 2) STATUS_CHANGED (якщо реально змінився)
+    await this.logStatusChange({
+      organizationId: invoice.organizationId,
+      actorUserId: invoice.createdById,
+      invoiceId: invoice.id,
+      from: beforeStatus,
+      to: InvoiceStatus.SENT,
+      meta: { via: 'sendInvoiceByEmail' },
+    });
+
+    return updated;
   }
 
   private async generateInvoiceNumber(organizationId: string): Promise<string> {
@@ -541,7 +605,6 @@ export class InvoicesService {
       throw new NotFoundException('User not found (sync user first)');
     }
 
-    // ✅ доступ до org
     await this.assertOrgAccess(createdByUser.id, organizationId);
 
     if (!items || items.length === 0) {
@@ -557,13 +620,12 @@ export class InvoicesService {
       this.calculateTotals(items);
 
     const maxAttempts = 3;
-    let lastError: any = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const number = await this.generateInvoiceNumber(organizationId);
 
       try {
-        return await this.prisma.invoice.create({
+        const invoice = await this.prisma.invoice.create({
           data: {
             organizationId,
             createdById: createdByUser.id,
@@ -600,13 +662,22 @@ export class InvoicesService {
             client: true,
           },
         });
-      } catch (e: any) {
-        lastError = e;
 
+        // ✅ Activity log: CREATED
+        await this.activity.create({
+          organizationId,
+          actorUserId: createdByUser.id,
+          entityType: ActivityEntityType.INVOICE,
+          entityId: invoice.id,
+          eventType: ActivityEventType.CREATED,
+          meta: { invoiceNumber: invoice.number },
+        });
+
+        return invoice;
+      } catch (e: any) {
         if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
           continue;
         }
-
         throw e;
       }
     }
@@ -669,6 +740,8 @@ export class InvoicesService {
       throw new NotFoundException('Інвойс не знайдено');
     }
 
+    const beforeStatus = existing.status;
+
     const issueDateParsed = dto.issueDate
       ? this.parseDate(dto.issueDate)
       : undefined;
@@ -718,16 +791,14 @@ export class InvoicesService {
       }));
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const updated = await this.prisma.$transaction(async (tx) => {
       if (hasItemsUpdate) {
         await tx.invoiceItem.deleteMany({
-          where: {
-            invoiceId: id,
-          },
+          where: { invoiceId: id },
         });
       }
 
-      const updated = await tx.invoice.update({
+      return tx.invoice.update({
         where: { id },
         data: {
           clientId: dto.clientId ?? undefined,
@@ -743,20 +814,26 @@ export class InvoicesService {
           total,
 
           items:
-            hasItemsUpdate && itemsCreate
-              ? {
-                  create: itemsCreate,
-                }
-              : undefined,
+            hasItemsUpdate && itemsCreate ? { create: itemsCreate } : undefined,
         },
-        include: {
-          items: true,
-          client: true,
-        },
+        include: { items: true, client: true },
       });
-
-      return updated;
     });
+
+    // ✅ Activity log: STATUS_CHANGED (лише якщо реально змінився)
+    const afterStatus = updated.status;
+    if (String(beforeStatus) !== String(afterStatus)) {
+      await this.logStatusChange({
+        organizationId: updated.organizationId,
+        actorUserId: updated.createdById,
+        invoiceId: updated.id,
+        from: beforeStatus,
+        to: afterStatus,
+        meta: { via: 'update' },
+      });
+    }
+
+    return updated;
   }
 
   async remove(id: string) {
@@ -770,13 +847,8 @@ export class InvoicesService {
   }
 
   async send(id: string) {
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id },
-    });
-
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    const invoice = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
     if (
       invoice.status === InvoiceStatus.PAID ||
@@ -787,27 +859,32 @@ export class InvoicesService {
       );
     }
 
-    return this.prisma.invoice.update({
+    const beforeStatus = invoice.status;
+
+    const updated = await this.prisma.invoice.update({
       where: { id },
       data: {
         status: InvoiceStatus.SENT,
         sentAt: new Date(),
       },
-      include: {
-        items: true,
-        client: true,
-      },
+      include: { items: true, client: true },
     });
+
+    await this.logStatusChange({
+      organizationId: updated.organizationId,
+      actorUserId: updated.createdById,
+      invoiceId: updated.id,
+      from: beforeStatus,
+      to: InvoiceStatus.SENT,
+      meta: { via: 'send' },
+    });
+
+    return updated;
   }
 
   async markPaid(id: string, dto: MarkInvoicePaidDto) {
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id },
-    });
-
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    const invoice = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
     if (invoice.status === InvoiceStatus.CANCELLED) {
       throw new BadRequestException('Скасований інвойс не можна оплатити');
@@ -817,32 +894,37 @@ export class InvoicesService {
       throw new BadRequestException('Інвойс вже має статус PAID');
     }
 
+    const beforeStatus = invoice.status;
+
     const paidAt =
       dto.paidAt != null
         ? (this.parseDate(dto.paidAt) ?? new Date())
         : new Date();
 
-    return this.prisma.invoice.update({
+    const updated = await this.prisma.invoice.update({
       where: { id },
       data: {
         status: InvoiceStatus.PAID,
         paidAt,
       },
-      include: {
-        items: true,
-        client: true,
-      },
+      include: { items: true, client: true },
     });
+
+    await this.logStatusChange({
+      organizationId: updated.organizationId,
+      actorUserId: updated.createdById,
+      invoiceId: updated.id,
+      from: beforeStatus,
+      to: InvoiceStatus.PAID,
+      meta: { via: 'markPaid' },
+    });
+
+    return updated;
   }
 
   async cancel(id: string) {
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id },
-    });
-
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    const invoice = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
     if (invoice.status === InvoiceStatus.PAID) {
       throw new BadRequestException('Оплачений інвойс не можна скасувати');
@@ -852,16 +934,24 @@ export class InvoicesService {
       throw new BadRequestException('Інвойс вже скасовано');
     }
 
-    return this.prisma.invoice.update({
+    const beforeStatus = invoice.status;
+
+    const updated = await this.prisma.invoice.update({
       where: { id },
-      data: {
-        status: InvoiceStatus.CANCELLED,
-      },
-      include: {
-        items: true,
-        client: true,
-      },
+      data: { status: InvoiceStatus.CANCELLED },
+      include: { items: true, client: true },
     });
+
+    await this.logStatusChange({
+      organizationId: updated.organizationId,
+      actorUserId: updated.createdById,
+      invoiceId: updated.id,
+      from: beforeStatus,
+      to: InvoiceStatus.CANCELLED,
+      meta: { via: 'cancel' },
+    });
+
+    return updated;
   }
 
   async getAnalytics(params: {
@@ -886,10 +976,7 @@ export class InvoicesService {
     const invoices = await this.prisma.invoice.findMany({
       where: {
         organizationId,
-        issueDate: {
-          gte: dateFrom,
-          lte: dateTo,
-        },
+        issueDate: { gte: dateFrom, lte: dateTo },
       },
       select: {
         status: true,
@@ -907,9 +994,8 @@ export class InvoicesService {
         const n = parseFloat(v);
         return isNaN(n) ? 0 : n;
       }
-      if (v && typeof v.toNumber === 'function') {
-        return v.toNumber();
-      }
+      // @ts-ignore
+      if (v && typeof v.toNumber === 'function') return v.toNumber();
       return 0;
     };
 
@@ -919,10 +1005,7 @@ export class InvoicesService {
 
     const monthMap = new Map<
       string,
-      {
-        issuedTotal: number;
-        paidTotal: number;
-      }
+      { issuedTotal: number; paidTotal: number }
     >();
 
     const getMonthKey = (d: Date) => {
@@ -946,16 +1029,14 @@ export class InvoicesService {
       if (inv.status === InvoiceStatus.OVERDUE) totalOverdue += amount;
 
       const issueKey = getMonthKey(inv.issueDate);
-      if (!monthMap.has(issueKey)) {
+      if (!monthMap.has(issueKey))
         monthMap.set(issueKey, { issuedTotal: 0, paidTotal: 0 });
-      }
       monthMap.get(issueKey)!.issuedTotal += amount;
 
       if (inv.status === InvoiceStatus.PAID && inv.paidAt) {
         const paidKey = getMonthKey(inv.paidAt);
-        if (!monthMap.has(paidKey)) {
+        if (!monthMap.has(paidKey))
           monthMap.set(paidKey, { issuedTotal: 0, paidTotal: 0 });
-        }
         monthMap.get(paidKey)!.paidTotal += amount;
       }
     }
