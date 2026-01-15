@@ -20,6 +20,13 @@ enum OrganizationMemberStatus {
   INACTIVE
 }
 
+enum ClientCrmStatus {
+  LEAD        // потенційний
+  IN_PROGRESS // в роботі
+  ACTIVE      // постійний / активний
+  INACTIVE    // неактивний
+}
+
 enum DocumentSource {
   UPLOAD
   MANUAL
@@ -417,6 +424,9 @@ model Client {
   taxNumber   String?
   notes       String?
 
+  crmStatus ClientCrmStatus @default(LEAD)
+  tags      String[]        @default([])
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -427,6 +437,7 @@ model Client {
   acts     Act[]
   quotes   Quote[]
 }
+
 
 // ---- Invoices ----
 
