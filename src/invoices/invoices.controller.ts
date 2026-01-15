@@ -19,13 +19,62 @@ import { InvoiceStatus } from '@prisma/client';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
-@UseGuards(ClerkAuthGuard) // 🔐 ВСІ /invoices/* тепер приватні
+@UseGuards(ClerkAuthGuard) // 🔐 ВСІ /invoices/* приватні
 @Controller('invoices')
 export class InvoicesController {
   constructor(
     private readonly invoicesService: InvoicesService,
     private readonly invoicePdfService: InvoicePdfService,
   ) {}
+
+  // ✅ NEW: дедлайни 1–2 дні (або будь-який діапазон)
+  @Get('due-soon')
+  async getDueSoon(
+    @Req() req: any,
+    @Query('organizationId') organizationId: string,
+    @Query('minDays') minDays?: string,
+    @Query('maxDays') maxDays?: string,
+    @Query('includeDraft') includeDraft?: string,
+    @Query('includeOverdue') includeOverdue?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const invoices = await this.invoicesService.getDueSoonInvoices({
+      authUserId: req.authUserId,
+      organizationId,
+      minDays: minDays != null ? Number(minDays) : undefined,
+      maxDays: maxDays != null ? Number(maxDays) : undefined,
+      includeDraft: includeDraft === 'true',
+      includeOverdue: includeOverdue === 'true',
+      limit: limit != null ? Number(limit) : undefined,
+    });
+
+    return { invoices };
+  }
+
+  // ✅ NEW: надіслати reminder (з PDF у вкладенні)
+  @Post(':id/send-deadline-reminder')
+  async sendDeadlineReminder(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body()
+    body?: {
+      force?: boolean;
+      message?: string;
+      variant?: 'ua' | 'international';
+    },
+  ) {
+    const result = await this.invoicesService.sendDeadlineReminder(
+      req.authUserId,
+      id,
+      {
+        force: Boolean(body?.force),
+        message: body?.message,
+        variant: body?.variant,
+      },
+    );
+
+    return result;
+  }
 
   @Get('analytics')
   async getAnalytics(
@@ -44,7 +93,6 @@ export class InvoicesController {
 
   @Post()
   async create(@Body() dto: CreateInvoiceDto, @Req() req: any) {
-    // ✅ createdByAuthUserId приходить з guard
     const invoice = await this.invoicesService.create(dto, req.authUserId);
     return { invoice };
   }
