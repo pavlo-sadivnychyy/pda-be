@@ -42,7 +42,7 @@ export class ActsController {
       throw new BadRequestException('invoiceId та number є обовʼязковими');
     }
 
-    const createdByAuthUserId = req.authUserId; // ✅ кладеш у guard
+    const createdByAuthUserId = req.authUserId;
     const act = await this.actsService.createFromInvoice({
       ...dto,
       createdByAuthUserId,
@@ -51,6 +51,7 @@ export class ActsController {
     return { act };
   }
 
+  // GET /acts?organizationId=...
   @Get()
   async list(@Query('organizationId') organizationId: string) {
     const { items } =
@@ -58,18 +59,21 @@ export class ActsController {
     return { items };
   }
 
+  // GET /acts/:id
   @Get(':id')
   async getById(@Param('id') id: string) {
     const { act } = await this.actsService.getById(id);
     return { act };
   }
 
+  // DELETE /acts/:id
   @Delete(':id')
   async remove(@Param('id') id: string) {
     const deleted = await this.actsService.remove(id);
     return { success: true, deleted };
   }
 
+  // GET /acts/:id/pdf
   @Get(':id/pdf')
   async getPdf(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =
@@ -81,5 +85,12 @@ export class ActsController {
       `inline; filename="${document.originalName}"`,
     );
     res.end(pdfBuffer);
+  }
+
+  // ✅ NEW: POST /acts/:id/send
+  @Post(':id/send')
+  async sendAct(@Param('id') id: string, @Req() req: any) {
+    const result = await this.actsService.sendActByEmail(req.authUserId, id);
+    return result;
   }
 }
