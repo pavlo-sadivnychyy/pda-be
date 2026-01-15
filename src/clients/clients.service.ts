@@ -45,6 +45,18 @@ export class ClientsService {
     }
   }
 
+  // ✅ NEW: normalize tags (trim, unique, limit)
+  private normalizeTags(input?: string[] | null): string[] {
+    if (!input || !Array.isArray(input)) return [];
+
+    const cleaned = input
+      .map((t) => (t ?? '').trim())
+      .filter(Boolean)
+      .map((t) => (t.length > 30 ? t.slice(0, 30) : t));
+
+    return Array.from(new Set(cleaned)).slice(0, 20);
+  }
+
   async create(authUserId: string, dto: CreateClientDto) {
     const dbUserId = await this.resolveDbUserId(authUserId);
 
@@ -59,6 +71,10 @@ export class ClientsService {
       taxNumber,
       address,
       notes,
+
+      // ✅ NEW
+      crmStatus,
+      tags,
     } = dto as any;
 
     if (!organizationId) {
@@ -82,6 +98,10 @@ export class ClientsService {
         taxNumber: taxNumber ?? null,
         address: address ?? null,
         notes: notes ?? null,
+
+        // ✅ NEW
+        crmStatus: crmStatus ?? undefined,
+        tags: this.normalizeTags(tags),
       },
     });
 
@@ -90,11 +110,16 @@ export class ClientsService {
 
   async findAll(
     authUserId: string,
-    params: { organizationId: string; search?: string },
+    params: {
+      organizationId: string;
+      search?: string;
+      crmStatus?: string;
+      tag?: string;
+    },
   ) {
     const dbUserId = await this.resolveDbUserId(authUserId);
 
-    const { organizationId, search } = params;
+    const { organizationId, search, crmStatus, tag } = params;
 
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
@@ -104,6 +129,17 @@ export class ClientsService {
 
     const where: any = { organizationId };
 
+    // ✅ NEW: filter by crmStatus
+    if (crmStatus && crmStatus.trim().length > 0) {
+      where.crmStatus = crmStatus.trim();
+    }
+
+    // ✅ NEW: filter by tag (Postgres array has)
+    if (tag && tag.trim().length > 0) {
+      where.tags = { has: tag.trim() };
+    }
+
+    // search
     if (search && search.trim().length > 0) {
       const q = search.trim();
       where.OR = [
@@ -112,6 +148,9 @@ export class ClientsService {
         { email: { contains: q, mode: 'insensitive' } },
         { phone: { contains: q, mode: 'insensitive' } },
         { taxNumber: { contains: q, mode: 'insensitive' } },
+
+        // ✅ бонус: якщо юзер ввів "VIP" — знайде по тегу теж
+        { tags: { has: q } },
       ];
     }
 
@@ -160,6 +199,12 @@ export class ClientsService {
         taxNumber: dto.taxNumber ?? undefined,
         address: dto.address ?? undefined,
         notes: dto.notes ?? undefined,
+
+        // ✅ NEW
+        crmStatus: (dto as any).crmStatus ?? undefined,
+        tags: (dto as any).tags
+          ? this.normalizeTags((dto as any).tags)
+          : undefined,
       },
     });
   }

@@ -28,18 +28,22 @@ export class ClientsController {
     return { client };
   }
 
-  // GET /clients?organizationId=...&search=...
+  // GET /clients?organizationId=...&search=...&crmStatus=...&tag=...
   @Get()
   async findAll(
     @Req() req: any,
     @Query('organizationId') organizationId: string,
     @Query('search') search?: string,
+    @Query('crmStatus') crmStatus?: string,
+    @Query('tag') tag?: string,
   ) {
     const authUserId = req.authUserId as string;
 
     const clients = await this.clientsService.findAll(authUserId, {
       organizationId,
       search,
+      crmStatus,
+      tag,
     });
 
     return { clients };
