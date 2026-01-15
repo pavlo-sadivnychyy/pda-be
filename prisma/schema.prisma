@@ -71,7 +71,6 @@ enum QuoteStatus {
   CONVERTED
 }
 
-
 // Інвойси
 
 enum InvoiceStatus {
@@ -117,8 +116,8 @@ model User {
   // ✅ 1:1 subscription (може бути null поки не створили)
   subscription Subscription?
 
-  organizations UserOrganization[]
-  ownedOrganization Organization? @relation("OwnerOrganizations")
+  organizations     UserOrganization[]
+  ownedOrganization Organization?      @relation("OwnerOrganizations")
 
   documents    Document[]
   chatSessions ChatSession[]
@@ -126,10 +125,11 @@ model User {
   todoTasks      TodoTask[]
   todoDailyPlans TodoDailyPlan[]
 
-  clients  Client[]
-  invoices Invoice[]
-  acts     Act[]
-  quotes   Quote[]
+  clients              Client[]
+  invoices             Invoice[]
+  acts                 Act[]
+  quotes               Quote[]
+  invoiceRemindersSent InvoiceReminderLog[] @relation("InvoiceReminderToUser")
 }
 
 // ---- Organization ----
@@ -180,12 +180,12 @@ model Organization {
   documents       Document[]
   chatSessions    ChatSession[]
 
-  clients  Client[]
-  invoices Invoice[]
-  acts     Act[]
-  quotes   Quote[]
+  clients          Client[]
+  invoices         Invoice[]
+  acts             Act[]
+  quotes           Quote[]
+  invoiceReminders InvoiceReminderLog[] @relation("InvoiceReminderToOrg")
 }
-
 
 // ---- UserOrganization ----
 
@@ -230,39 +230,39 @@ model BusinessProfile {
 // ---- SubscriptionPlan / Subscription ----
 
 model Subscription {
-  id                   String   @id @default(cuid())
+  id String @id @default(cuid())
 
-  userId               String   @unique
-  user                 User     @relation(fields: [userId], references: [id])
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
 
-  planId               PlanId   @default(FREE) // ✅ дефолт FREE
+  planId PlanId @default(FREE) // ✅ дефолт FREE
 
   stripeCustomerId     String?
   stripeSubscriptionId String?
-  status               String   @default("active")
+  status               String    @default("active")
   trialStart           DateTime?
   trialEnd             DateTime?
   currentPeriodStart   DateTime?
   currentPeriodEnd     DateTime?
-  cancelAtPeriodEnd    Boolean  @default(false)
+  cancelAtPeriodEnd    Boolean   @default(false)
 
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // ---- Documents ----
 
 model Quote {
-  id             String   @id @default(cuid())
+  id             String  @id @default(cuid())
   organizationId String
   clientId       String?
   createdById    String
 
   number     String
-  issueDate  DateTime @default(now())
+  issueDate  DateTime  @default(now())
   validUntil DateTime?
 
-  currency String     @default("USD")
+  currency String      @default("USD")
   status   QuoteStatus @default(DRAFT)
 
   subtotal  Decimal  @db.Decimal(18, 2)
@@ -294,8 +294,6 @@ model Quote {
   @@unique([organizationId, number])
   @@index([organizationId, createdAt])
 }
-
-
 
 model QuoteItem {
   id      String @id @default(cuid())
@@ -348,8 +346,8 @@ model Document {
   invoiceInternational Invoice? @relation("InvoiceInternationalDocument")
 
   // pdf-документ для акта
-  act Act? @relation("ActDocument")
-  quote   Quote?   @relation("QuoteDocument")
+  act   Act?   @relation("ActDocument")
+  quote Quote? @relation("QuoteDocument")
 }
 
 model DocumentChunk {
@@ -466,14 +464,14 @@ model Invoice {
   client       Client?      @relation(fields: [clientId], references: [id])
   createdBy    User         @relation(fields: [createdById], references: [id])
 
-  items InvoiceItem[]
-  acts  Act[]
+  items              InvoiceItem[]
+  acts               Act[]
   convertedFromQuote Quote?
+  reminders          InvoiceReminderLog[] @relation("InvoiceReminderToInvoice")
 
   @@unique([organizationId, number])
   @@index([organizationId, createdAt])
 }
-
 
 model InvoiceItem {
   id        String @id @default(cuid())
@@ -568,4 +566,30 @@ model TodoDailyPlan {
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
+}
+
+enum InvoiceReminderKind {
+  DEADLINE
+}
+
+model InvoiceReminderLog {
+  id             String @id @default(cuid())
+  invoiceId      String
+  organizationId String
+  sentById       String
+
+  kind InvoiceReminderKind @default(DEADLINE)
+
+  toEmail String
+  subject String?
+  message String?
+  sentAt  DateTime @default(now())
+
+  invoice      Invoice      @relation("InvoiceReminderToInvoice", fields: [invoiceId], references: [id])
+  organization Organization @relation("InvoiceReminderToOrg", fields: [organizationId], references: [id])
+  sentBy       User         @relation("InvoiceReminderToUser", fields: [sentById], references: [id])
+
+  @@index([organizationId, sentAt])
+  @@index([invoiceId, sentAt])
+  @@index([invoiceId, kind, sentAt])
 }

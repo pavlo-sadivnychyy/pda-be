@@ -20,6 +20,40 @@ export class InvoicesService {
     private readonly invoicePdf: InvoicePdfService,
   ) {}
 
+  // =========================
+  // ✅ AUTH/ORG ACCESS HELPERS
+  // =========================
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
+  }
+
+  private async assertOrgAccess(dbUserId: string, organizationId: string) {
+    if (!organizationId)
+      throw new BadRequestException('organizationId is required');
+
+    const membership = await this.prisma.userOrganization.findUnique({
+      where: { userId_organizationId: { userId: dbUserId, organizationId } },
+      select: { id: true },
+    });
+
+    if (!membership) {
+      throw new BadRequestException('No access to this organization');
+    }
+  }
+
   private parseDate(dateStr?: string): Date | undefined {
     if (!dateStr) return undefined;
     const d = new Date(dateStr);
@@ -40,6 +74,246 @@ export class InvoicesService {
     );
   }
 
+  // =========================
+  // ✅ DEADLINES: LIST
+  // =========================
+  async getDueSoonInvoices(params: {
+    authUserId: string;
+    organizationId: string;
+    minDays?: number; // default 1
+    maxDays?: number; // default 2
+    includeDraft?: boolean; // default false
+    includeOverdue?: boolean; // default false
+    limit?: number; // default 20
+  }) {
+    const {
+      authUserId,
+      organizationId,
+      minDays = 1,
+      maxDays = 2,
+      includeDraft = false,
+      includeOverdue = false,
+      limit = 20,
+    } = params;
+
+    if (!organizationId) {
+      throw new BadRequestException('organizationId є обовʼязковим');
+    }
+
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOrgAccess(dbUserId, organizationId);
+
+    const now = new Date();
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+
+    const from = new Date(start);
+    from.setDate(from.getDate() + Math.max(0, minDays));
+
+    const to = new Date(start);
+    to.setDate(to.getDate() + Math.max(minDays, maxDays) + 1); // exclusive end
+
+    const statusFilter: any = {
+      notIn: [InvoiceStatus.PAID, InvoiceStatus.CANCELLED],
+    };
+
+    // якщо не хочемо DRAFT — виключаємо
+    if (!includeDraft) {
+      statusFilter.notIn = Array.from(
+        new Set([...(statusFilter.notIn ?? []), InvoiceStatus.DRAFT]),
+      );
+    }
+
+    const dueWhere: any = {
+      not: null,
+      gte: from,
+      lt: to,
+    };
+
+    // якщо треба includeOverdue — тоді показуємо і прострочені
+    // прострочені — це dueDate < from (тобто раніше вікна) або dueDate < сьогодні
+    // але ти просив "1–2 дні" — тож дефолтно false.
+    if (includeOverdue) {
+      dueWhere.gte = undefined;
+      dueWhere.lt = to;
+    }
+
+    const invoices = await this.prisma.invoice.findMany({
+      where: {
+        organizationId,
+        dueDate: dueWhere,
+        status: statusFilter,
+      },
+      orderBy: [{ dueDate: 'asc' }, { createdAt: 'desc' }],
+      take: Math.min(Math.max(limit, 1), 100),
+      include: {
+        client: {
+          select: {
+            id: true,
+            name: true,
+            contactName: true,
+            email: true,
+          },
+        },
+        reminders: {
+          orderBy: { sentAt: 'desc' },
+          take: 1,
+          select: { id: true, sentAt: true },
+        },
+      },
+    });
+
+    return invoices;
+  }
+
+  // =========================
+  // ✅ DEADLINES: SEND REMINDER (with PDF)
+  // =========================
+  async sendDeadlineReminder(
+    authUserId: string,
+    invoiceId: string,
+    options?: {
+      force?: boolean;
+      message?: string;
+      variant?: 'ua' | 'international';
+    },
+  ) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: {
+        organization: true,
+        client: true,
+        items: true,
+        pdfDocument: true,
+        pdfInternationalDocument: true,
+      },
+    });
+
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    if (!invoice.dueDate) {
+      throw new BadRequestException('Invoice dueDate is empty.');
+    }
+
+    if (
+      invoice.status === InvoiceStatus.PAID ||
+      invoice.status === InvoiceStatus.CANCELLED
+    ) {
+      throw new BadRequestException(
+        `Не можна надсилати нагадування для статусу ${invoice.status}`,
+      );
+    }
+
+    if (!invoice.client || !invoice.client.email) {
+      throw new BadRequestException(
+        'Client email is empty. Fill client.email first.',
+      );
+    }
+
+    // ✅ анти-спам 12 год (можна force=true)
+    const force = Boolean(options?.force);
+    if (!force) {
+      const last = await this.prisma.invoiceReminderLog.findFirst({
+        where: { invoiceId, kind: 'DEADLINE' as any },
+        orderBy: { sentAt: 'desc' },
+        select: { sentAt: true },
+      });
+
+      if (last?.sentAt) {
+        const diffMs = Date.now() - new Date(last.sentAt).getTime();
+        const hours = diffMs / (1000 * 60 * 60);
+        if (hours < 12) {
+          throw new BadRequestException(
+            'Reminder was already sent recently. Try later or use force.',
+          );
+        }
+      }
+    }
+
+    const to = invoice.client.email.trim();
+    const orgName = invoice.organization?.name || 'Your company';
+    const due = invoice.dueDate.toISOString().slice(0, 10);
+
+    // ===== PDF variant =====
+    const variant = options?.variant ?? 'ua';
+    const isUa = variant === 'ua';
+
+    const { pdfBuffer } = isUa
+      ? await this.invoicePdf.getOrCreatePdfForInvoiceUa(invoice.id)
+      : await this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoice.id);
+
+    const safeNumber = String(invoice.number).replace(/[^a-zA-Z0-9\-]/g, '_');
+    const pdfName = isUa
+      ? `invoice-ua-${safeNumber}.pdf`
+      : `invoice-int-${safeNumber}.pdf`;
+
+    const subject = `Нагадування: інвойс ${invoice.number} має дедлайн ${due}`;
+    const greeting = invoice.client.contactName || invoice.client.name || '';
+    const extra = options?.message?.trim() || '';
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; color: #111827;">
+        <h2>Нагадування про оплату</h2>
+
+        <p>Вітаємо${greeting ? `, ${greeting}` : ''}!</p>
+
+        <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
+          <div><b>Інвойс:</b> ${invoice.number}</div>
+          <div><b>Дедлайн:</b> ${due}</div>
+        </div>
+
+        ${
+          extra
+            ? `<p style="margin-top:14px; white-space: pre-line;">${extra}</p>`
+            : ''
+        }
+
+        <p style="margin-top:16px;">
+          PDF інвойсу у вкладенні цього листа.
+        </p>
+
+        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
+          Sent from ${orgName}
+        </p>
+      </div>
+    `;
+
+    await this.email.sendMail({
+      to,
+      subject,
+      html,
+      text: `Нагадування про оплату\nІнвойс: ${invoice.number}\nДедлайн: ${due}\nPDF у вкладенні`,
+      attachments: [
+        {
+          filename: pdfName,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    await this.prisma.invoiceReminderLog.create({
+      data: {
+        invoiceId: invoice.id,
+        organizationId: invoice.organizationId,
+        sentById: dbUserId,
+        kind: 'DEADLINE' as any,
+        toEmail: to,
+        subject,
+        message: extra || null,
+      } as any,
+    });
+
+    return { success: true };
+  }
+
+  // =========================
+  // ✅ EXISTING: SEND INVOICE (with PDF + status SENT)
+  // =========================
   async sendInvoiceByEmail(id: string, variant: 'ua' | 'international' = 'ua') {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
@@ -112,28 +386,28 @@ export class InvoicesService {
       : `invoice-int-${invoice.number}.pdf`;
 
     const html = `
-    <div style="font-family: Arial, sans-serif; color: #111827;">
-      <h2>${title}</h2>
-      <p>${isUa ? 'Вітаємо' : 'Hello'} ${greeting},</p>
+      <div style="font-family: Arial, sans-serif; color: #111827;">
+        <h2>${title}</h2>
+        <p>${isUa ? 'Вітаємо' : 'Hello'} ${greeting},</p>
 
-      <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
-        <div><b>${isUa ? 'Інвойс' : 'Invoice'}:</b> ${invoice.number}</div>
-        <div><b>${isUa ? 'Сума' : 'Total'}:</b> ${totalStr}</div>
+        <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
+          <div><b>${isUa ? 'Інвойс' : 'Invoice'}:</b> ${invoice.number}</div>
+          <div><b>${isUa ? 'Сума' : 'Total'}:</b> ${totalStr}</div>
+        </div>
+
+        <p style="margin-top:16px;">
+          ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
+        </p>
+
+        <a href="${invoiceUrl}" style="display:inline-block;padding:10px 14px;background:#111827;color:white;border-radius:999px;text-decoration:none;">
+          ${viewLabel}
+        </a>
+
+        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
+          Sent from ${orgName}
+        </p>
       </div>
-
-      <p style="margin-top:16px;">
-        ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
-      </p>
-
-      <a href="${invoiceUrl}" style="display:inline-block;padding:10px 14px;background:#111827;color:white;border-radius:999px;text-decoration:none;">
-        ${viewLabel}
-      </a>
-
-      <p style="margin-top:16px;font-size:12px;color:#6b7280;">
-        Sent from ${orgName}
-      </p>
-    </div>
-  `;
+    `;
 
     await this.email.sendMail({
       to,
@@ -238,15 +512,6 @@ export class InvoicesService {
     };
   }
 
-  /**
-   * ✅ Create invoice:
-   * - createdByAuthUserId приходить з Clerk guard (req.authUserId)
-   * - мапимо його на нашого User.id
-   *
-   * ✅ FIX:
-   * - number унікальний тепер в межах organizationId
-   * - додано ретрай на P2002, якщо 2 запити одночасно згенерили однаковий number
-   */
   async create(dto: CreateInvoiceDto, createdByAuthUserId: string) {
     const {
       organizationId,
@@ -276,6 +541,9 @@ export class InvoicesService {
       throw new NotFoundException('User not found (sync user first)');
     }
 
+    // ✅ доступ до org
+    await this.assertOrgAccess(createdByUser.id, organizationId);
+
     if (!items || items.length === 0) {
       throw new BadRequestException(
         'Потрібно додати хоча б одну позицію інвойсу',
@@ -288,7 +556,6 @@ export class InvoicesService {
     const { subtotal, taxAmount, total, lineTotals } =
       this.calculateTotals(items);
 
-    // ✅ Ретрай: якщо два запити одночасно створили один номер — пробуємо ще раз
     const maxAttempts = 3;
     let lastError: any = null;
 
@@ -336,12 +603,10 @@ export class InvoicesService {
       } catch (e: any) {
         lastError = e;
 
-        // якщо номер уже зайнятий — повторюємо
         if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
           continue;
         }
 
-        // інші помилки — кидаємо як є
         throw e;
       }
     }
