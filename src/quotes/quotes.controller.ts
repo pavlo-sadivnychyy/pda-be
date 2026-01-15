@@ -10,6 +10,7 @@ import {
   Query,
   Res,
   UseGuards,
+  Req,
 } from '@nestjs/common';
 
 import { QuotesService } from './quotes.service';
@@ -19,7 +20,7 @@ import { UpdateQuoteDto } from './dto/update-quote.dto';
 import { QuotePdfService } from './quote-pdf.service';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
-@UseGuards(ClerkAuthGuard) // ✅ весь контролер захищений
+@UseGuards(ClerkAuthGuard)
 @Controller('quotes')
 export class QuotesController {
   constructor(
@@ -70,36 +71,50 @@ export class QuotesController {
   }
 
   @Post(':id/send')
-  async send(@Param('id') id: string) {
-    const quote = await this.quotesService.sendQuoteByEmail(id);
+  async send(@Param('id') id: string, @Req() req: any) {
+    const quote = await this.quotesService.sendQuoteByEmail(req.authUserId, id);
     return { quote };
   }
 
   @Post(':id/accept')
-  async accept(@Param('id') id: string) {
-    const quote = await this.quotesService.markStatus(id, QuoteStatus.ACCEPTED);
+  async accept(@Param('id') id: string, @Req() req: any) {
+    const quote = await this.quotesService.markStatus(
+      req.authUserId,
+      id,
+      QuoteStatus.ACCEPTED,
+    );
     return { quote };
   }
 
   @Post(':id/reject')
-  async reject(@Param('id') id: string) {
-    const quote = await this.quotesService.markStatus(id, QuoteStatus.REJECTED);
+  async reject(@Param('id') id: string, @Req() req: any) {
+    const quote = await this.quotesService.markStatus(
+      req.authUserId,
+      id,
+      QuoteStatus.REJECTED,
+    );
     return { quote };
   }
 
   @Post(':id/expire')
-  async expire(@Param('id') id: string) {
-    const quote = await this.quotesService.markStatus(id, QuoteStatus.EXPIRED);
+  async expire(@Param('id') id: string, @Req() req: any) {
+    const quote = await this.quotesService.markStatus(
+      req.authUserId,
+      id,
+      QuoteStatus.EXPIRED,
+    );
     return { quote };
   }
 
   @Post(':id/convert-to-invoice')
-  async convertToInvoice(@Param('id') id: string) {
-    const invoice = await this.quotesService.convertToInvoice(id);
+  async convertToInvoice(@Param('id') id: string, @Req() req: any) {
+    const invoice = await this.quotesService.convertToInvoice(
+      req.authUserId,
+      id,
+    );
     return { invoice };
   }
 
-  // PDF endpoint (Next proxy буде викликати цей)
   @Get(':id/pdf')
   async getPdf(@Param('id') id: string, @Res() res: any) {
     const { document, pdfBuffer } =

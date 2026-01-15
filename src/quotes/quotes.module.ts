@@ -7,9 +7,10 @@ import { QuotePdfService } from './quote-pdf.service';
 
 import { EmailModule } from '../email/email.module';
 import { FileStorageService } from '../file-storage/file-storage.service';
+import { ActivityModule } from '../activity/activity.module';
 
 @Module({
-  imports: [EmailModule],
+  imports: [EmailModule, ActivityModule],
   controllers: [QuotesController],
   providers: [
     PrismaService,
