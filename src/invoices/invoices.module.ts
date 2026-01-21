@@ -6,9 +6,10 @@ import { InvoicePdfService } from './invoice-pdf.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { EmailModule } from '../email/email.module';
 import { ActivityModule } from '../activity/activity.module';
+import { PlanModule } from '../plan/plan.module';
 
 @Module({
-  imports: [EmailModule, ActivityModule],
+  imports: [EmailModule, ActivityModule, PlanModule],
   controllers: [InvoicesController],
   providers: [
     InvoicesService,

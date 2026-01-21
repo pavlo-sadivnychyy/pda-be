@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  NotFoundException,
-  ForbiddenException,
-  BadRequestException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import {
   ChatMessageRole,
   ChatSessionStatus,
@@ -13,31 +8,15 @@ import {
 
 import { PrismaService } from '../prisma/prisma.service';
 import { AiService } from '../ai/ai.service';
+import { PlanService } from '../plan/plan.service';
 
 @Injectable()
 export class ChatService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ai: AiService,
+    private readonly plan: PlanService,
   ) {}
-
-  // ✅ clerk authUserId -> db userId
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
 
   // --------- СЕСІЇ ---------
 
@@ -47,8 +26,8 @@ export class ChatService {
   }) {
     const { organizationId, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
-    await this.ensureUserInOrganization(organizationId, userId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(userId, organizationId);
 
     return this.prisma.chatSession.findMany({
       where: { organizationId },
@@ -60,22 +39,18 @@ export class ChatService {
   async getSessionById(params: { id: string; authUserId: string }) {
     const { id, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id },
       include: {
-        messages: {
-          orderBy: { createdAt: 'asc' },
-        },
+        messages: { orderBy: { createdAt: 'asc' } },
       },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
 
     return session;
   }
@@ -87,10 +62,10 @@ export class ChatService {
   }) {
     const { organizationId, authUserId, title } = params;
 
-    const createdById = await this.resolveDbUserId(authUserId);
-    await this.ensureUserInOrganization(organizationId, createdById);
+    const createdById = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(createdById, organizationId);
 
-    const session = await this.prisma.chatSession.create({
+    return this.prisma.chatSession.create({
       data: {
         organizationId,
         createdById,
@@ -98,34 +73,25 @@ export class ChatService {
         status: ChatSessionStatus.ACTIVE,
       },
     });
-
-    return session;
   }
 
-  // ✅ DELETE session (+ messages) — hard delete
   async deleteSession(params: { sessionId: string; authUserId: string }) {
     const { sessionId, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
       select: { id: true, organizationId: true },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
 
     await this.prisma.$transaction([
-      this.prisma.chatMessage.deleteMany({
-        where: { sessionId: session.id },
-      }),
-      this.prisma.chatSession.delete({
-        where: { id: session.id },
-      }),
+      this.prisma.chatMessage.deleteMany({ where: { sessionId: session.id } }),
+      this.prisma.chatSession.delete({ where: { id: session.id } }),
     ]);
 
     return { ok: true };
@@ -140,17 +106,18 @@ export class ChatService {
   }) {
     const { sessionId, authUserId, content } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
+
+    // ✅ AI quota by plan (FREE 5/mo, BASIC 50/mo, PRO ∞)
+    await this.plan.assertAiQuota(userId, session.organizationId);
 
     const userMessage = await this.prisma.chatMessage.create({
       data: {
@@ -207,9 +174,7 @@ export class ChatService {
         sessionId: session.id,
         role: ChatMessageRole.ASSISTANT,
         content: assistantText,
-        metadata: {
-          knowledgeSources: knowledgeSnippets,
-        },
+        metadata: { knowledgeSources: knowledgeSnippets },
       },
     });
 
@@ -218,27 +183,10 @@ export class ChatService {
       data: { updatedAt: new Date() },
     });
 
-    return {
-      userMessage,
-      assistantMessage,
-      knowledgeSnippets,
-    };
+    return { userMessage, assistantMessage, knowledgeSnippets };
   }
 
   // --------- HELPERS ---------
-
-  private async ensureUserInOrganization(
-    organizationId: string,
-    userId: string,
-  ) {
-    const membership = await this.prisma.userOrganization.findFirst({
-      where: { organizationId, userId },
-    });
-
-    if (!membership) {
-      throw new ForbiddenException('User does not belong to this organization');
-    }
-  }
 
   private buildBusinessContext(
     profile: BusinessProfile | null,
@@ -297,9 +245,7 @@ export class ChatService {
     }
 
     const chunks = await this.prisma.documentChunk.findMany({
-      where: {
-        document: { organizationId, status: 'READY' as any },
-      },
+      where: { document: { organizationId, status: 'READY' as any } },
       include: { document: true },
       take: 1000,
     });

@@ -24,9 +24,20 @@ export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
   async upsertUser(input: UpsertUserInput) {
+    if (!input.authUserId) {
+      throw new BadRequestException('authUserId is required');
+    }
+    if (!input.email) {
+      throw new BadRequestException('email is required');
+    }
+    if (!input.authProvider) {
+      throw new BadRequestException('authProvider is required');
+    }
+
     const fullName = [input.firstName, input.lastName]
       .filter(Boolean)
-      .join(' ');
+      .join(' ')
+      .trim();
 
     const user = await this.prisma.user.upsert({
       where: { authUserId: input.authUserId },
@@ -41,6 +52,7 @@ export class UsersService {
         locale: input.locale ?? null,
         timezone: input.timezone ?? null,
         jobTitle: input.jobTitle ?? null,
+        lastLoginAt: new Date(),
       },
       update: {
         email: input.email,
@@ -55,6 +67,7 @@ export class UsersService {
       },
     });
 
+    // ✅ гарантуємо, що subscription існує
     await this.prisma.subscription.upsert({
       where: { userId: user.id },
       create: {

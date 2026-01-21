@@ -8,13 +8,14 @@ import { QuotePdfService } from './quote-pdf.service';
 import { EmailModule } from '../email/email.module';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { ActivityModule } from '../activity/activity.module';
+import { PlanModule } from '../plan/plan.module';
 
 @Module({
-  imports: [EmailModule, ActivityModule],
+  imports: [EmailModule, ActivityModule, PlanModule],
   controllers: [QuotesController],
   providers: [
     PrismaService,
-    FileStorageService, // ✅ Ось це треба, бо модулю нема
+    FileStorageService,
     QuotesService,
     QuotePdfService,
   ],

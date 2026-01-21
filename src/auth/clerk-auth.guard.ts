@@ -3,12 +3,19 @@ import {
   ExecutionContext,
   Injectable,
   UnauthorizedException,
-  InternalServerErrorException,
 } from '@nestjs/common';
 import { createClerkClient } from '@clerk/backend';
+import { Headers, Request } from 'undici';
+
+export type RequestWithAuth = {
+  headers?: any;
+  authUserId?: string;
+  authSessionId?: string | null;
+  clerkAuth?: any;
+};
 
 function extractBearer(req: any): string | null {
-  const raw = req.headers?.authorization ?? req.headers?.Authorization;
+  const raw = req?.headers?.authorization ?? req?.headers?.Authorization;
   const header = Array.isArray(raw) ? raw[0] : raw;
   if (!header || typeof header !== 'string') return null;
   if (!header.startsWith('Bearer ')) return null;
@@ -19,33 +26,25 @@ function extractBearer(req: any): string | null {
 export class ClerkAuthGuard implements CanActivate {
   private clerk = createClerkClient({
     secretKey: process.env.CLERK_SECRET_KEY!,
-    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!, // ✅ додали
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
   });
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
-    const req = ctx.switchToHttp().getRequest();
+    const req = ctx.switchToHttp().getRequest<RequestWithAuth>();
 
     const token = extractBearer(req);
     if (!token) throw new UnauthorizedException('Missing Bearer token');
 
-    const HeadersCtor = (globalThis as any).Headers;
-    const RequestCtor = (globalThis as any).Request;
-
-    if (!HeadersCtor || !RequestCtor) {
-      throw new InternalServerErrorException(
-        'Web Request/Headers are not available',
-      );
-    }
-
-    const headers = new HeadersCtor();
+    const headers = new Headers();
     headers.set('authorization', `Bearer ${token}`);
 
-    const clerkReq = new RequestCtor('http://localhost/auth', { headers });
+    // URL не важливий — Clerk читає заголовки
+    const clerkReq = new Request('http://localhost/auth', { headers });
 
     const requestState = await (this.clerk as any).authenticateRequest(
       clerkReq,
     );
-    const auth = requestState.toAuth();
+    const auth = requestState.toAuth?.() ?? requestState;
 
     const userId =
       auth && typeof auth === 'object' && 'userId' in auth ? auth.userId : null;

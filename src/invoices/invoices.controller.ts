@@ -19,7 +19,7 @@ import { InvoiceStatus } from '@prisma/client';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
-@UseGuards(ClerkAuthGuard) // 🔐 ВСІ /invoices/* приватні
+@UseGuards(ClerkAuthGuard)
 @Controller('invoices')
 export class InvoicesController {
   constructor(
@@ -27,7 +27,6 @@ export class InvoicesController {
     private readonly invoicePdfService: InvoicePdfService,
   ) {}
 
-  // ✅ NEW: дедлайни 1–2 дні (або будь-який діапазон)
   @Get('due-soon')
   async getDueSoon(
     @Req() req: any,
@@ -51,7 +50,6 @@ export class InvoicesController {
     return { invoices };
   }
 
-  // ✅ NEW: надіслати reminder (з PDF у вкладенні)
   @Post(':id/send-deadline-reminder')
   async sendDeadlineReminder(
     @Req() req: any,
@@ -63,26 +61,22 @@ export class InvoicesController {
       variant?: 'ua' | 'international';
     },
   ) {
-    const result = await this.invoicesService.sendDeadlineReminder(
-      req.authUserId,
-      id,
-      {
-        force: Boolean(body?.force),
-        message: body?.message,
-        variant: body?.variant,
-      },
-    );
-
-    return result;
+    return this.invoicesService.sendDeadlineReminder(req.authUserId, id, {
+      force: Boolean(body?.force),
+      message: body?.message,
+      variant: body?.variant,
+    });
   }
 
   @Get('analytics')
   async getAnalytics(
+    @Req() req: any,
     @Query('organizationId') organizationId: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
     const analytics = await this.invoicesService.getAnalytics({
+      authUserId: req.authUserId,
       organizationId,
       from,
       to,
@@ -99,11 +93,13 @@ export class InvoicesController {
 
   @Get()
   async findAll(
+    @Req() req: any,
     @Query('organizationId') organizationId: string,
     @Query('status') status?: InvoiceStatus,
     @Query('clientId') clientId?: string,
   ) {
     const invoices = await this.invoicesService.findAll({
+      authUserId: req.authUserId,
       organizationId,
       status,
       clientId,
@@ -113,29 +109,45 @@ export class InvoicesController {
   }
 
   @Get(':id')
-  async findOne(@Param('id') id: string) {
-    const invoice = await this.invoicesService.findOne(id);
+  async findOne(@Req() req: any, @Param('id') id: string) {
+    const invoice = await this.invoicesService.findOne({
+      authUserId: req.authUserId,
+      id,
+    });
     return { invoice };
   }
 
   @Patch(':id')
-  async update(@Param('id') id: string, @Body() dto: UpdateInvoiceDto) {
-    const invoice = await this.invoicesService.update(id, dto);
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateInvoiceDto,
+  ) {
+    const invoice = await this.invoicesService.update({
+      authUserId: req.authUserId,
+      id,
+      dto,
+    });
     return { invoice };
   }
 
   @Delete(':id')
-  async remove(@Param('id') id: string) {
-    const result = await this.invoicesService.remove(id);
+  async remove(@Req() req: any, @Param('id') id: string) {
+    const result = await this.invoicesService.remove({
+      authUserId: req.authUserId,
+      id,
+    });
     return { success: true, deleted: result };
   }
 
   @Post(':id/send')
   async send(
+    @Req() req: any,
     @Param('id') id: string,
     @Query('variant') variant?: 'ua' | 'international',
   ) {
     const invoice = await this.invoicesService.sendInvoiceByEmail(
+      req.authUserId,
       id,
       variant ?? 'ua',
     );
@@ -143,19 +155,31 @@ export class InvoicesController {
   }
 
   @Post(':id/mark-paid')
-  async markPaid(@Param('id') id: string, @Body() dto: MarkInvoicePaidDto) {
-    const invoice = await this.invoicesService.markPaid(id, dto);
+  async markPaid(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: MarkInvoicePaidDto,
+  ) {
+    const invoice = await this.invoicesService.markPaid(
+      req.authUserId,
+      id,
+      dto,
+    );
     return { invoice };
   }
 
   @Post(':id/cancel')
-  async cancel(@Param('id') id: string) {
-    const invoice = await this.invoicesService.cancel(id);
+  async cancel(@Req() req: any, @Param('id') id: string) {
+    const invoice = await this.invoicesService.cancel(req.authUserId, id);
     return { invoice };
   }
 
+  // PDF endpoints: allowed for all plans, but must pass org access (service already enforces via findOne)
   @Get(':id/pdf')
-  async getPdfUa(@Param('id') id: string, @Res() res: any) {
+  async getPdfUa(@Req() req: any, @Param('id') id: string, @Res() res: any) {
+    // ensure access
+    await this.invoicesService.findOne({ authUserId: req.authUserId, id });
+
     const { document, pdfBuffer } =
       await this.invoicePdfService.getOrCreatePdfForInvoiceUa(id);
 
@@ -168,7 +192,13 @@ export class InvoicesController {
   }
 
   @Get(':id/pdf-international')
-  async getPdfInternational(@Param('id') id: string, @Res() res: any) {
+  async getPdfInternational(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Res() res: any,
+  ) {
+    await this.invoicesService.findOne({ authUserId: req.authUserId, id });
+
     const { document, pdfBuffer } =
       await this.invoicePdfService.getOrCreatePdfForInvoiceInternational(id);
 

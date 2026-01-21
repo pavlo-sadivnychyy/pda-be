@@ -3,16 +3,15 @@ import { Document, DocumentStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { AiService } from '../ai/ai.service';
+import { PlanService } from '../plan/plan.service';
 
 import * as mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
-
-// PDF.js – стабільний варіант
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 type CreateDocumentInput = {
   organizationId: string;
-  createdById: string;
+  createdById: string; // DB userId
 
   title: string;
   originalName: string;
@@ -60,6 +59,7 @@ export class KnowledgeBaseService {
     private readonly prisma: PrismaService,
     private readonly fileStorage: FileStorageService,
     private readonly ai: AiService,
+    private readonly plan: PlanService,
   ) {
     this.enableEmbeddings =
       (process.env.KB_ENABLE_EMBEDDINGS || 'false').toLowerCase() === 'true';
@@ -67,31 +67,49 @@ export class KnowledgeBaseService {
 
   // ---------- PUBLIC ----------
 
-  async listDocumentsForOrganization(organizationId: string) {
+  async listDocumentsForOrganization(
+    authUserId: string,
+    organizationId: string,
+  ) {
+    const userId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(userId, organizationId);
+
     return this.prisma.document.findMany({
       where: { organizationId },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async getDocumentById(id: string) {
+  async getDocumentById(authUserId: string, id: string) {
+    const userId = await this.plan.resolveDbUserId(authUserId);
+
     const doc = await this.prisma.document.findUnique({
       where: { id },
       include: { chunks: true },
     });
 
-    if (!doc) {
-      throw new NotFoundException('Document not found');
-    }
+    if (!doc) throw new NotFoundException('Document not found');
+
+    await this.plan.assertOrgAccess(userId, doc.organizationId);
 
     return doc;
   }
 
-  async createDocument(input: CreateDocumentInput) {
+  // ✅ create record (limits enforced here)
+  async createDocument(
+    authUserId: string,
+    input: Omit<CreateDocumentInput, 'createdById'>,
+  ) {
+    const userId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(userId, input.organizationId);
+
+    // ✅ documents limit by plan
+    await this.plan.assertDocumentsLimit(userId, input.organizationId);
+
     const doc = await this.prisma.document.create({
       data: {
         organizationId: input.organizationId,
-        createdById: input.createdById,
+        createdById: userId,
         title: input.title,
         originalName: input.originalName,
         mimeType: input.mimeType,
@@ -111,7 +129,18 @@ export class KnowledgeBaseService {
     return doc;
   }
 
-  async deleteDocument(id: string) {
+  async deleteDocument(authUserId: string, id: string) {
+    const userId = await this.plan.resolveDbUserId(authUserId);
+
+    const doc = await this.prisma.document.findUnique({
+      where: { id },
+      select: { id: true, organizationId: true, storageKey: true },
+    });
+
+    if (!doc) throw new NotFoundException('Document not found');
+
+    await this.plan.assertOrgAccess(userId, doc.organizationId);
+
     await this.prisma.documentChunk.deleteMany({
       where: { documentId: id },
     });
@@ -120,14 +149,21 @@ export class KnowledgeBaseService {
       where: { id },
     });
 
+    // (optional) delete file from storage if you want:
+    // if (doc.storageKey) await this.fileStorage.deleteFile(doc.storageKey);
+
     return { success: true };
   }
 
   async searchInOrganization(
+    authUserId: string,
     organizationId: string,
     query: string,
     limit = 10,
   ) {
+    const userId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(userId, organizationId);
+
     if (!query.trim()) return [];
 
     return this.prisma.documentChunk.findMany({
@@ -211,18 +247,15 @@ export class KnowledgeBaseService {
     const mt = (mimeType || '').toLowerCase();
     const name = (originalName || '').toLowerCase();
 
-    // PDF
     if (mt.includes('pdf') || name.endsWith('.pdf')) {
       return extractPdfText(buffer);
     }
 
-    // DOCX
     if (mt.includes('word') || name.endsWith('.docx')) {
       const res = await mammoth.extractRawText({ buffer });
       return res.value || '';
     }
 
-    // XLSX / XLS
     if (
       mt.includes('excel') ||
       name.endsWith('.xlsx') ||
@@ -247,7 +280,6 @@ export class KnowledgeBaseService {
       return parts.join('\n');
     }
 
-    // TXT
     return buffer.toString('utf-8');
   }
 
@@ -270,9 +302,8 @@ export class KnowledgeBaseService {
 
   private splitTextIntoChunks(text: string, size: number) {
     const out: string[] = [];
-    for (let i = 0; i < text.length; i += size) {
+    for (let i = 0; i < text.length; i += size)
       out.push(text.slice(i, i + size));
-    }
     return out;
   }
 

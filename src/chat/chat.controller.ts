@@ -27,15 +27,13 @@ class SendMessageDto {
 export class ChatController {
   constructor(private readonly chat: ChatService) {}
 
-  // GET /chat/sessions?organizationId=...
   @Get('sessions')
   async listSessions(
     @Req() req: any,
     @Query('organizationId') organizationId: string,
   ) {
-    if (!organizationId) {
+    if (!organizationId)
       throw new BadRequestException('organizationId is required');
-    }
 
     const items = await this.chat.listSessionsForOrg({
       organizationId,
@@ -45,7 +43,6 @@ export class ChatController {
     return { items };
   }
 
-  // GET /chat/sessions/:id
   @Get('sessions/:id')
   async getSession(@Req() req: any, @Param('id') id: string) {
     const session = await this.chat.getSessionById({
@@ -55,12 +52,10 @@ export class ChatController {
     return { session };
   }
 
-  // POST /chat/sessions
   @Post('sessions')
   async createSession(@Req() req: any, @Body() dto: CreateSessionDto) {
-    if (!dto.organizationId) {
+    if (!dto.organizationId)
       throw new BadRequestException('organizationId is required');
-    }
 
     const session = await this.chat.createSession({
       organizationId: dto.organizationId,
@@ -71,7 +66,6 @@ export class ChatController {
     return { session };
   }
 
-  // POST /chat/sessions/:id/messages
   @Post('sessions/:id/messages')
   async sendMessage(
     @Req() req: any,
@@ -89,7 +83,6 @@ export class ChatController {
     });
   }
 
-  // DELETE /chat/sessions/:id
   @Delete('sessions/:id')
   async deleteSession(@Req() req: any, @Param('id') id: string) {
     return this.chat.deleteSession({

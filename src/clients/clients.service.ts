@@ -6,46 +6,15 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
+import { PlanService } from '../plan/plan.service';
 
 @Injectable()
 export class ClientsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly plan: PlanService,
+  ) {}
 
-  // ✅ clerk authUserId -> db userId (User.id)
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
-
-  // ✅ (опціонально, але раджу) перевірка доступу до організації
-  private async assertOrgAccess(dbUserId: string, organizationId: string) {
-    if (!organizationId)
-      throw new BadRequestException('organizationId is required');
-
-    const membership = await this.prisma.userOrganization.findUnique({
-      where: { userId_organizationId: { userId: dbUserId, organizationId } },
-      select: { id: true },
-    });
-
-    // якщо у тебе тільки owner - можеш перевіряти org.ownerId === dbUserId
-    if (!membership) {
-      throw new BadRequestException('No access to this organization');
-    }
-  }
-
-  // ✅ NEW: normalize tags (trim, unique, limit)
   private normalizeTags(input?: string[] | null): string[] {
     if (!input || !Array.isArray(input)) return [];
 
@@ -58,11 +27,10 @@ export class ClientsService {
   }
 
   async create(authUserId: string, dto: CreateClientDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const {
       organizationId,
-      // createdById ігноруємо (бо може бути підміна)
       createdById: _ignoreCreatedById,
       name,
       contactName,
@@ -71,8 +39,6 @@ export class ClientsService {
       taxNumber,
       address,
       notes,
-
-      // ✅ NEW
       crmStatus,
       tags,
     } = dto as any;
@@ -81,16 +47,17 @@ export class ClientsService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    await this.assertOrgAccess(dbUserId, organizationId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+    await this.plan.assertClientsLimit(dbUserId, organizationId);
 
     if (!name) {
       throw new BadRequestException('Поле name є обовʼязковим');
     }
 
-    const client = await this.prisma.client.create({
+    return this.prisma.client.create({
       data: {
         organizationId,
-        createdById: dbUserId, // ✅ справжній userId з DB
+        createdById: dbUserId,
         name,
         contactName: contactName ?? null,
         email: email ?? null,
@@ -99,13 +66,10 @@ export class ClientsService {
         address: address ?? null,
         notes: notes ?? null,
 
-        // ✅ NEW
         crmStatus: crmStatus ?? undefined,
         tags: this.normalizeTags(tags),
       },
     });
-
-    return client;
   }
 
   async findAll(
@@ -117,30 +81,21 @@ export class ClientsService {
       tag?: string;
     },
   ) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
     const { organizationId, search, crmStatus, tag } = params;
 
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    await this.assertOrgAccess(dbUserId, organizationId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
 
     const where: any = { organizationId };
 
-    // ✅ NEW: filter by crmStatus
-    if (crmStatus && crmStatus.trim().length > 0) {
-      where.crmStatus = crmStatus.trim();
-    }
+    if (crmStatus?.trim()) where.crmStatus = crmStatus.trim();
+    if (tag?.trim()) where.tags = { has: tag.trim() };
 
-    // ✅ NEW: filter by tag (Postgres array has)
-    if (tag && tag.trim().length > 0) {
-      where.tags = { has: tag.trim() };
-    }
-
-    // search
-    if (search && search.trim().length > 0) {
+    if (search?.trim()) {
       const q = search.trim();
       where.OR = [
         { name: { contains: q, mode: 'insensitive' } },
@@ -148,8 +103,6 @@ export class ClientsService {
         { email: { contains: q, mode: 'insensitive' } },
         { phone: { contains: q, mode: 'insensitive' } },
         { taxNumber: { contains: q, mode: 'insensitive' } },
-
-        // ✅ бонус: якщо юзер ввів "VIP" — знайде по тегу теж
         { tags: { has: q } },
       ];
     }
@@ -161,33 +114,22 @@ export class ClientsService {
   }
 
   async findOne(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
-    const client = await this.prisma.client.findUnique({
-      where: { id },
-    });
+    const client = await this.prisma.client.findUnique({ where: { id } });
+    if (!client) throw new NotFoundException('Клієнта не знайдено');
 
-    if (!client) {
-      throw new NotFoundException('Клієнта не знайдено');
-    }
-
-    await this.assertOrgAccess(dbUserId, client.organizationId);
-
+    await this.plan.assertOrgAccess(dbUserId, client.organizationId);
     return client;
   }
 
   async update(authUserId: string, id: string, dto: UpdateClientDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
-    const existing = await this.prisma.client.findUnique({
-      where: { id },
-    });
+    const existing = await this.prisma.client.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Клієнта не знайдено');
 
-    if (!existing) {
-      throw new NotFoundException('Клієнта не знайдено');
-    }
-
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
     return this.prisma.client.update({
       where: { id },
@@ -200,7 +142,6 @@ export class ClientsService {
         address: dto.address ?? undefined,
         notes: dto.notes ?? undefined,
 
-        // ✅ NEW
         crmStatus: (dto as any).crmStatus ?? undefined,
         tags: (dto as any).tags
           ? this.normalizeTags((dto as any).tags)
@@ -210,35 +151,26 @@ export class ClientsService {
   }
 
   async remove(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const existing = await this.prisma.client.findUnique({
       where: { id },
-      select: { id: true, name: true, organizationId: true },
+      select: { id: true, organizationId: true },
     });
+    if (!existing) throw new NotFoundException('Клієнта не знайдено');
 
-    if (!existing) {
-      throw new NotFoundException('Клієнта не знайдено');
-    }
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
-
-    // 1) Перевіряємо акти
-    const actsCount = await this.prisma.act.count({
-      where: { clientId: id },
-    });
-
+    const actsCount = await this.prisma.act.count({ where: { clientId: id } });
     if (actsCount > 0) {
       throw new BadRequestException(
         `Не можна видалити клієнта: до нього прив’язано актів: ${actsCount}.`,
       );
     }
 
-    // 2) Перевіряємо інвойси
     const invoicesCount = await this.prisma.invoice.count({
       where: { clientId: id },
     });
-
     if (invoicesCount > 0) {
       throw new BadRequestException(
         `Не можна видалити клієнта: до нього прив’язано інвойсів: ${invoicesCount}.`,
@@ -246,7 +178,6 @@ export class ClientsService {
     }
 
     await this.prisma.client.delete({ where: { id } });
-
     return { success: true };
   }
 }

@@ -23,8 +23,7 @@ export class ClientsController {
   // POST /clients
   @Post()
   async create(@Req() req: any, @Body() dto: CreateClientDto) {
-    const authUserId = req.authUserId as string;
-    const client = await this.clientsService.create(authUserId, dto);
+    const client = await this.clientsService.create(req.authUserId, dto);
     return { client };
   }
 
@@ -37,9 +36,7 @@ export class ClientsController {
     @Query('crmStatus') crmStatus?: string,
     @Query('tag') tag?: string,
   ) {
-    const authUserId = req.authUserId as string;
-
-    const clients = await this.clientsService.findAll(authUserId, {
+    const clients = await this.clientsService.findAll(req.authUserId, {
       organizationId,
       search,
       crmStatus,
@@ -52,8 +49,7 @@ export class ClientsController {
   // GET /clients/:id
   @Get(':id')
   async findOne(@Req() req: any, @Param('id') id: string) {
-    const authUserId = req.authUserId as string;
-    const client = await this.clientsService.findOne(authUserId, id);
+    const client = await this.clientsService.findOne(req.authUserId, id);
     return { client };
   }
 
@@ -64,15 +60,13 @@ export class ClientsController {
     @Param('id') id: string,
     @Body() dto: UpdateClientDto,
   ) {
-    const authUserId = req.authUserId as string;
-    const client = await this.clientsService.update(authUserId, id, dto);
+    const client = await this.clientsService.update(req.authUserId, id, dto);
     return { client };
   }
 
   // DELETE /clients/:id
   @Delete(':id')
   async remove(@Req() req: any, @Param('id') id: string) {
-    const authUserId = req.authUserId as string;
-    return this.clientsService.remove(authUserId, id);
+    return this.clientsService.remove(req.authUserId, id);
   }
 }

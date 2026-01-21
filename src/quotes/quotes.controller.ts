@@ -12,24 +12,22 @@ import {
   UseGuards,
   Req,
 } from '@nestjs/common';
+import type { Response } from 'express';
 
 import { QuotesService } from './quotes.service';
 import { QuoteStatus } from '@prisma/client';
 import { CreateQuoteDto } from './dto/create-quote.dto';
 import { UpdateQuoteDto } from './dto/update-quote.dto';
-import { QuotePdfService } from './quote-pdf.service';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
 @UseGuards(ClerkAuthGuard)
 @Controller('quotes')
 export class QuotesController {
-  constructor(
-    private readonly quotesService: QuotesService,
-    private readonly quotePdfService: QuotePdfService,
-  ) {}
+  constructor(private readonly quotesService: QuotesService) {}
 
   @Get()
   async list(
+    @Req() req: any,
     @Query('organizationId') organizationId: string,
     @Query('status') status?: QuoteStatus,
     @Query('clientId') clientId?: string,
@@ -37,7 +35,7 @@ export class QuotesController {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
 
-    const quotes = await this.quotesService.findAll({
+    const quotes = await this.quotesService.findAll(req.authUserId, {
       organizationId,
       status,
       clientId,
@@ -47,27 +45,31 @@ export class QuotesController {
   }
 
   @Get(':id')
-  async getOne(@Param('id') id: string) {
-    const quote = await this.quotesService.findOne(id);
+  async getOne(@Req() req: any, @Param('id') id: string) {
+    const quote = await this.quotesService.findOne(req.authUserId, id);
     return { quote };
   }
 
   @Post()
-  async create(@Body() dto: CreateQuoteDto) {
-    const quote = await this.quotesService.create(dto);
+  async create(@Req() req: any, @Body() dto: CreateQuoteDto) {
+    const quote = await this.quotesService.create(req.authUserId, dto);
     return { quote };
   }
 
   @Patch(':id')
-  async update(@Param('id') id: string, @Body() dto: UpdateQuoteDto) {
-    const quote = await this.quotesService.update(id, dto);
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateQuoteDto,
+  ) {
+    const quote = await this.quotesService.update(req.authUserId, id, dto);
     return { quote };
   }
 
   @Delete(':id')
-  async remove(@Param('id') id: string) {
-    await this.quotesService.remove(id);
-    return { success: true };
+  async remove(@Req() req: any, @Param('id') id: string) {
+    const res = await this.quotesService.remove(req.authUserId, id);
+    return res;
   }
 
   @Post(':id/send')
@@ -116,16 +118,17 @@ export class QuotesController {
   }
 
   @Get(':id/pdf')
-  async getPdf(@Param('id') id: string, @Res() res: any) {
-    const { document, pdfBuffer } =
-      await this.quotePdfService.getOrCreatePdfForQuote(id);
+  async getPdf(@Req() req: any, @Param('id') id: string, @Res() res: Response) {
+    const { document, pdfBuffer } = await this.quotesService.getQuotePdf(
+      req.authUserId,
+      id,
+    );
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
       `inline; filename="${document.originalName}"`,
     );
-
     res.end(pdfBuffer);
   }
 }
