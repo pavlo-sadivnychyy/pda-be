@@ -32,8 +32,9 @@ export class QuotesController {
     @Query('status') status?: QuoteStatus,
     @Query('clientId') clientId?: string,
   ) {
-    if (!organizationId)
+    if (!organizationId) {
       throw new BadRequestException('organizationId is required');
+    }
 
     const quotes = await this.quotesService.findAll(req.authUserId, {
       organizationId,
@@ -68,8 +69,7 @@ export class QuotesController {
 
   @Delete(':id')
   async remove(@Req() req: any, @Param('id') id: string) {
-    const res = await this.quotesService.remove(req.authUserId, id);
-    return res;
+    return this.quotesService.remove(req.authUserId, id);
   }
 
   @Post(':id/send')

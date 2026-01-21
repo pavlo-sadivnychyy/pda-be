@@ -125,17 +125,26 @@ export class QuotesService {
     });
   }
 
+  // -------------------------
+  // ✅ SINGLE PLACE: access + plan gate
+  // -------------------------
+  private async assertQuotesAccess(authUserId: string, organizationId: string) {
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId); // ✅ FREE -> throws
+
+    return { dbUserId, planId };
+  }
+
   // =========================
-  // ✅ CRUD (WITH AUTH + PLAN)
+  // ✅ CRUD (GET теж блокуємо)
   // =========================
 
   async create(authUserId: string, dto: CreateQuoteDto) {
-    // 🔒 Quotes: BASIC/PRO only
-    const dbUserId = await this.plan.resolveDbUserId(authUserId);
-
     const {
       organizationId,
-      // createdById IGNORE (no spoofing)
       createdById: _ignoreCreatedById,
       clientId,
       issueDate,
@@ -146,18 +155,15 @@ export class QuotesService {
       items,
     } = dto as any;
 
-    if (!organizationId) {
+    if (!organizationId)
       throw new BadRequestException('organizationId is required');
-    }
-
-    await this.plan.assertOrgAccess(dbUserId, organizationId);
-
-    const planId = await this.plan.getPlanIdForUser(dbUserId);
-    this.plan.assertCanUseQuotes(planId);
-
-    if (!items || items.length === 0) {
+    if (!items || items.length === 0)
       throw new BadRequestException('items are required');
-    }
+
+    const { dbUserId } = await this.assertQuotesAccess(
+      authUserId,
+      organizationId,
+    );
 
     const issueDateParsed = this.parseDate(issueDate) ?? new Date();
     const validUntilParsed = this.parseDate(validUntil);
@@ -229,15 +235,14 @@ export class QuotesService {
     authUserId: string,
     params: { organizationId: string; status?: QuoteStatus; clientId?: string },
   ) {
-    const dbUserId = await this.plan.resolveDbUserId(authUserId);
     const { organizationId, status, clientId } = params;
 
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
 
-    await this.plan.assertOrgAccess(dbUserId, organizationId);
+    // ✅ тепер FREE теж отримає помилку
+    await this.assertQuotesAccess(authUserId, organizationId);
 
-    // навіть якщо FREE — list можна дозволити, але там їх просто не буде
     return this.prisma.quote.findMany({
       where: {
         organizationId,
@@ -265,6 +270,9 @@ export class QuotesService {
 
     await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
 
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId); // ✅ FREE -> throws
+
     return quote;
   }
 
@@ -279,7 +287,6 @@ export class QuotesService {
 
     await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
-    // 🔒 Quotes: BASIC/PRO only
     const planId = await this.plan.getPlanIdForUser(dbUserId);
     this.plan.assertCanUseQuotes(planId);
 
@@ -365,7 +372,6 @@ export class QuotesService {
 
     await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
 
-    // 🔒 Quotes: BASIC/PRO only
     const planId = await this.plan.getPlanIdForUser(dbUserId);
     this.plan.assertCanUseQuotes(planId);
 
@@ -444,7 +450,6 @@ export class QuotesService {
     }
 
     const to = quote.client.email.trim();
-
     const orgName = quote.organization?.name || 'Your company';
     const subject = `Commercial Offer ${quote.number} from ${orgName}`;
 
@@ -453,7 +458,6 @@ export class QuotesService {
     ).replace(/\/$/, '');
     const quoteUrl = `${appUrl}/quotes/${quote.id}`;
 
-    // ✅ PDF is also part of Quotes feature -> already gated above
     const { pdfBuffer } = await this.quotePdf.getOrCreatePdfForQuote(id);
 
     const money = (v: any) => {
@@ -532,11 +536,7 @@ export class QuotesService {
       entityId: quote.id,
       eventType: ActivityEventType.SENT,
       toEmail: to,
-      meta: {
-        quoteNumber: quote.number,
-        subject,
-        total: totalStr,
-      },
+      meta: { quoteNumber: quote.number, subject, total: totalStr },
     });
 
     await this.logStatusChange({
@@ -566,7 +566,6 @@ export class QuotesService {
 
     await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
 
-    // Quotes themselves are BASIC/PRO, conversion is allowed on BASIC/PRO too
     const planId = await this.plan.getPlanIdForUser(dbUserId);
     this.plan.assertCanUseQuotes(planId);
 
@@ -648,7 +647,7 @@ export class QuotesService {
   }
 
   // =========================
-  // ✅ PDF ACCESS (BASIC/PRO)
+  // ✅ PDF (BASIC/PRO)
   // =========================
   async getQuotePdf(authUserId: string, quoteId: string) {
     const dbUserId = await this.plan.resolveDbUserId(authUserId);
