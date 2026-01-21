@@ -3,7 +3,6 @@ import {
   Injectable,
   NotFoundException,
   InternalServerErrorException,
-  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -14,11 +13,11 @@ import {
   Prisma,
   ActivityEntityType,
   ActivityEventType,
-  PlanId,
 } from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { InvoicePdfService } from './invoice-pdf.service';
 import { ActivityService } from '../activity/activity.service';
+import { PlanService } from '../plan/plan.service';
 
 @Injectable()
 export class InvoicesService {
@@ -27,63 +26,8 @@ export class InvoicesService {
     private readonly email: EmailService,
     private readonly invoicePdf: InvoicePdfService,
     private readonly activity: ActivityService,
+    private readonly plan: PlanService,
   ) {}
-
-  // =========================
-  // ✅ AUTH/ORG ACCESS HELPERS
-  // =========================
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
-
-  // ✅ planId
-  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
-    const sub = await this.prisma.subscription.findUnique({
-      where: { userId: dbUserId },
-      select: { planId: true },
-    });
-
-    return (sub?.planId as PlanId) ?? PlanId.FREE;
-  }
-
-  // ✅ доступ до організації (membership якщо є, і fallback на owner-only)
-  private async assertOrgAccess(dbUserId: string, organizationId: string) {
-    if (!organizationId)
-      throw new BadRequestException('organizationId is required');
-
-    // 1) membership (якщо раптом є)
-    const membership = await this.prisma.userOrganization.findUnique({
-      where: { userId_organizationId: { userId: dbUserId, organizationId } },
-      select: { id: true },
-    });
-
-    if (membership) return;
-
-    // 2) owner-only fallback (твій кейс)
-    const org = await this.prisma.organization.findUnique({
-      where: { id: organizationId },
-      select: { ownerId: true },
-    });
-
-    if (!org) throw new BadRequestException('Organization not found');
-
-    if (org.ownerId !== dbUserId) {
-      throw new BadRequestException('No access to this organization');
-    }
-  }
 
   private parseDate(dateStr?: string): Date | undefined {
     if (!dateStr) return undefined;
@@ -126,89 +70,9 @@ export class InvoicesService {
     });
   }
 
-  // =========================
-  // ✅ PLAN LIMITS / FEATURES
-  // =========================
-
-  // FREE: до 3 інвойсів (загалом, бо в твоєму тексті без “/місяць”)
-  // BASIC: до 20 інвойсів / місяць
-  // PRO: безліміт
-  private getInvoiceLimit(planId: PlanId): {
-    mode: 'TOTAL' | 'MONTHLY' | 'UNLIMITED';
-    limit?: number;
-  } {
-    switch (planId) {
-      case PlanId.FREE:
-        return { mode: 'TOTAL', limit: 3 };
-      case PlanId.BASIC:
-        return { mode: 'MONTHLY', limit: 20 };
-      case PlanId.PRO:
-        return { mode: 'UNLIMITED' };
-      default:
-        return { mode: 'TOTAL', limit: 3 };
-    }
-  }
-
-  private canSendEmail(planId: PlanId): boolean {
-    return planId === PlanId.BASIC || planId === PlanId.PRO;
-  }
-
-  private canSendReminders(planId: PlanId): boolean {
-    return planId === PlanId.PRO;
-  }
-
-  private canViewAnalytics(planId: PlanId): boolean {
-    return planId === PlanId.PRO;
-  }
-
-  private async assertInvoiceCreateLimit(
-    dbUserId: string,
-    organizationId: string,
-  ) {
-    const planId = await this.getUserPlanId(dbUserId);
-    const rule = this.getInvoiceLimit(planId);
-
-    if (rule.mode === 'UNLIMITED') return;
-
-    if (!rule.limit || rule.limit <= 0) {
-      throw new BadRequestException('Invalid plan limits configuration');
-    }
-
-    if (rule.mode === 'TOTAL') {
-      const total = await this.prisma.invoice.count({
-        where: { organizationId },
-      });
-      if (total >= rule.limit) {
-        throw new BadRequestException(
-          `Ліміт інвойсів для плану ${planId}: дозволено ${rule.limit} (загалом). Оновіть підписку, щоб створювати більше інвойсів.`,
-        );
-      }
-      return;
-    }
-
-    // MONTHLY
-    const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth(), 1);
-    const end = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-
-    const monthly = await this.prisma.invoice.count({
-      where: {
-        organizationId,
-        createdAt: { gte: start, lt: end },
-      },
-    });
-
-    if (monthly >= rule.limit) {
-      const ym = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}`;
-      throw new BadRequestException(
-        `Ліміт інвойсів для плану ${planId}: дозволено ${rule.limit} / місяць (місяць ${ym}). Оновіть підписку, щоб створювати більше інвойсів.`,
-      );
-    }
-  }
-
-  // =========================
-  // ✅ DEADLINES: LIST
-  // =========================
+  // ------------------------------------------------
+  // ✅ DUE SOON (PRO only)
+  // ------------------------------------------------
   async getDueSoonInvoices(params: {
     authUserId: string;
     organizationId: string;
@@ -232,8 +96,11 @@ export class InvoicesService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertOrgAccess(dbUserId, organizationId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseInvoiceReminders(planId); // ✅ PRO only
 
     const now = new Date();
     const start = new Date(now);
@@ -255,11 +122,7 @@ export class InvoicesService {
       );
     }
 
-    const dueWhere: any = {
-      not: null,
-      gte: from,
-      lt: to,
-    };
+    const dueWhere: any = { not: null, gte: from, lt: to };
 
     if (includeOverdue) {
       dueWhere.gte = undefined;
@@ -276,12 +139,7 @@ export class InvoicesService {
       take: Math.min(Math.max(limit, 1), 100),
       include: {
         client: {
-          select: {
-            id: true,
-            name: true,
-            contactName: true,
-            email: true,
-          },
+          select: { id: true, name: true, contactName: true, email: true },
         },
         reminders: {
           orderBy: { sentAt: 'desc' },
@@ -294,9 +152,9 @@ export class InvoicesService {
     return invoices;
   }
 
-  // =========================
-  // ✅ DEADLINES: SEND REMINDER (with PDF) — PRO ONLY
-  // =========================
+  // ------------------------------------------------
+  // ✅ SEND DEADLINE REMINDER (PRO only + email gating)
+  // ------------------------------------------------
   async sendDeadlineReminder(
     authUserId: string,
     invoiceId: string,
@@ -306,7 +164,7 @@ export class InvoicesService {
       variant?: 'ua' | 'international';
     },
   ) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
@@ -321,14 +179,11 @@ export class InvoicesService {
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
 
-    const planId = await this.getUserPlanId(dbUserId);
-    if (!this.canSendReminders(planId)) {
-      throw new ForbiddenException(
-        `Нагадування про оплату доступні лише в плані PRO. Поточний план: ${planId}`,
-      );
-    }
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseInvoiceReminders(planId); // ✅ PRO only
+    this.plan.assertCanSendEmail(planId); // (redundant because PRO, but ok)
 
     if (!invoice.dueDate) {
       throw new BadRequestException('Invoice dueDate is empty.');
@@ -391,7 +246,6 @@ export class InvoicesService {
     const html = `
       <div style="font-family: Arial, sans-serif; color: #111827;">
         <h2>Нагадування про оплату</h2>
-
         <p>Вітаємо${greeting ? `, ${greeting}` : ''}!</p>
 
         <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
@@ -399,19 +253,11 @@ export class InvoicesService {
           <div><b>Дедлайн:</b> ${due}</div>
         </div>
 
-        ${
-          extra
-            ? `<p style="margin-top:14px; white-space: pre-line;">${extra}</p>`
-            : ''
-        }
+        ${extra ? `<p style="margin-top:14px; white-space: pre-line;">${extra}</p>` : ''}
 
-        <p style="margin-top:16px;">
-          PDF інвойсу у вкладенні цього листа.
-        </p>
+        <p style="margin-top:16px;">PDF інвойсу у вкладенні цього листа.</p>
 
-        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
-          Sent from ${orgName}
-        </p>
+        <p style="margin-top:16px;font-size:12px;color:#6b7280;">Sent from ${orgName}</p>
       </div>
     `;
 
@@ -458,22 +304,15 @@ export class InvoicesService {
     return { success: true };
   }
 
-  // =========================
-  // ✅ SEND INVOICE BY EMAIL — BASIC/PRO ONLY + AUTH + ORG ACCESS
-  // =========================
+  // ------------------------------------------------
+  // ✅ SEND INVOICE BY EMAIL (email gating)
+  // ------------------------------------------------
   async sendInvoiceByEmail(
     authUserId: string,
     id: string,
     variant: 'ua' | 'international' = 'ua',
   ) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    const planId = await this.getUserPlanId(dbUserId);
-    if (!this.canSendEmail(planId)) {
-      throw new ForbiddenException(
-        `Відправка документів на email доступна з плану BASIC. Поточний план: ${planId}`,
-      );
-    }
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
@@ -488,7 +327,10 @@ export class InvoicesService {
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanSendEmail(planId); // ✅ BASIC/PRO only
 
     if (
       invoice.status === InvoiceStatus.PAID ||
@@ -514,7 +356,6 @@ export class InvoicesService {
     const invoiceUrl = `${appUrl}/invoices/${invoice.id}`;
 
     const isUa = variant === 'ua';
-
     const { pdfBuffer } = isUa
       ? await this.invoicePdf.getOrCreatePdfForInvoiceUa(invoice.id)
       : await this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoice.id);
@@ -541,10 +382,9 @@ export class InvoicesService {
 
     const title = isUa ? 'Рахунок-фактура' : 'Invoice';
     const viewLabel = isUa ? 'Переглянути інвойс' : 'View invoice';
-    const safeNumber = String(invoice.number).replace(/[^a-zA-Z0-9\-]/g, '_');
     const pdfName = isUa
-      ? `invoice-ua-${safeNumber}.pdf`
-      : `invoice-int-${safeNumber}.pdf`;
+      ? `invoice-ua-${invoice.number}.pdf`
+      : `invoice-int-${invoice.number}.pdf`;
 
     const html = `
       <div style="font-family: Arial, sans-serif; color: #111827;">
@@ -592,10 +432,7 @@ export class InvoicesService {
         status: InvoiceStatus.SENT,
         sentAt: new Date(),
       },
-      include: {
-        items: true,
-        client: true,
-      },
+      include: { items: true, client: true },
     });
 
     await this.activity.create({
@@ -605,11 +442,7 @@ export class InvoicesService {
       entityId: invoice.id,
       eventType: ActivityEventType.SENT,
       toEmail: to,
-      meta: {
-        invoiceNumber: invoice.number,
-        variant,
-        subject,
-      },
+      meta: { invoiceNumber: invoice.number, variant, subject },
     });
 
     await this.logStatusChange({
@@ -624,9 +457,6 @@ export class InvoicesService {
     return updated;
   }
 
-  // =========================
-  // ✅ INVOICE NUMBER / TOTALS
-  // =========================
   private async generateInvoiceNumber(organizationId: string): Promise<string> {
     const year = new Date().getFullYear();
     const prefix = `INV-${year}-`;
@@ -655,11 +485,7 @@ export class InvoicesService {
   }
 
   private calculateTotals(
-    items: {
-      quantity: number;
-      unitPrice: number;
-      taxRate?: number;
-    }[],
+    items: { quantity: number; unitPrice: number; taxRate?: number }[],
   ): {
     subtotal: Prisma.Decimal | number;
     taxAmount: Prisma.Decimal | number;
@@ -694,17 +520,12 @@ export class InvoicesService {
 
     const total = subtotal + taxAmount;
 
-    return {
-      subtotal,
-      taxAmount,
-      total,
-      lineTotals,
-    };
+    return { subtotal, taxAmount, total, lineTotals };
   }
 
-  // =========================
-  // ✅ CREATE (LIMIT ENFORCED)
-  // =========================
+  // ------------------------------------------------
+  // ✅ CREATE (limits)
+  // ------------------------------------------------
   async create(dto: CreateInvoiceDto, createdByAuthUserId: string) {
     const {
       organizationId,
@@ -721,15 +542,12 @@ export class InvoicesService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    if (!createdByAuthUserId) {
-      throw new BadRequestException('auth user id is required');
-    }
+    const createdByUserId =
+      await this.plan.resolveDbUserId(createdByAuthUserId);
+    await this.plan.assertOrgAccess(createdByUserId, organizationId);
 
-    const createdByUserId = await this.resolveDbUserId(createdByAuthUserId);
-    await this.assertOrgAccess(createdByUserId, organizationId);
-
-    // ✅ ліміт інвойсів по плану
-    await this.assertInvoiceCreateLimit(createdByUserId, organizationId);
+    // ✅ invoices limit by plan (FREE total 3, BASIC 20/month, PRO unlimited)
+    await this.plan.assertInvoicesLimit(createdByUserId, organizationId);
 
     if (!items || items.length === 0) {
       throw new BadRequestException(
@@ -781,10 +599,7 @@ export class InvoicesService {
               })),
             },
           },
-          include: {
-            items: true,
-            client: true,
-          },
+          include: { items: true, client: true },
         });
 
         await this.activity.create({
@@ -798,9 +613,7 @@ export class InvoicesService {
 
         return invoice;
       } catch (e: any) {
-        if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
-          continue;
-        }
+        if (this.isUniqueNumberError(e) && attempt < maxAttempts) continue;
         throw e;
       }
     }
@@ -810,9 +623,9 @@ export class InvoicesService {
     );
   }
 
-  // =========================
-  // ✅ READ (AUTH + ORG ACCESS)
-  // =========================
+  // ------------------------------------------------
+  // ✅ READ LIST/ONE (auth + org access)
+  // ------------------------------------------------
   async findAll(params: {
     authUserId: string;
     organizationId: string;
@@ -825,61 +638,57 @@ export class InvoicesService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertOrgAccess(dbUserId, organizationId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
 
     return this.prisma.invoice.findMany({
       where: {
         organizationId,
-        status,
+        status: status ?? undefined,
         clientId: clientId ?? undefined,
       },
-      orderBy: {
-        createdAt: 'desc',
-      },
-      include: {
-        items: true,
-        client: true,
-      },
+      orderBy: { createdAt: 'desc' },
+      include: { items: true, client: true },
     });
   }
 
-  async findOne(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+  async findOne(params: { authUserId: string; id: string }) {
+    const { authUserId, id } = params;
+
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
-      include: {
-        items: true,
-        client: true,
-      },
+      include: { items: true, client: true },
     });
 
-    if (!invoice) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
 
     return invoice;
   }
 
-  // =========================
-  // ✅ UPDATE/DELETE (AUTH + ORG ACCESS)
-  // =========================
-  async update(authUserId: string, id: string, dto: UpdateInvoiceDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+  // ------------------------------------------------
+  // ✅ UPDATE/DELETE (auth + org access)
+  // ------------------------------------------------
+  async update(params: {
+    authUserId: string;
+    id: string;
+    dto: UpdateInvoiceDto;
+  }) {
+    const { authUserId, id, dto } = params;
+
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const existing = await this.prisma.invoice.findUnique({
       where: { id },
       include: { items: true },
     });
 
-    if (!existing) {
-      throw new NotFoundException('Інвойс не знайдено');
-    }
+    if (!existing) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
     const beforeStatus = existing.status;
 
@@ -934,9 +743,7 @@ export class InvoicesService {
 
     const updated = await this.prisma.$transaction(async (tx) => {
       if (hasItemsUpdate) {
-        await tx.invoiceItem.deleteMany({
-          where: { invoiceId: id },
-        });
+        await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
       }
 
       return tx.invoice.update({
@@ -976,37 +783,34 @@ export class InvoicesService {
     return updated;
   }
 
-  async remove(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+  async remove(params: { authUserId: string; id: string }) {
+    const { authUserId, id } = params;
 
-    const invoice = await this.prisma.invoice.findUnique({
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+
+    const existing = await this.prisma.invoice.findUnique({
       where: { id },
       select: { id: true, organizationId: true },
     });
+    if (!existing) throw new NotFoundException('Інвойс не знайдено');
 
-    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.prisma.invoiceItem.deleteMany({ where: { invoiceId: id } });
 
-    await this.prisma.invoiceItem.deleteMany({
-      where: { invoiceId: id },
-    });
-
-    return this.prisma.invoice.delete({
-      where: { id },
-    });
+    return this.prisma.invoice.delete({ where: { id } });
   }
 
-  // =========================
-  // ✅ SIMPLE STATUS ACTIONS (AUTH + ORG ACCESS)
-  // =========================
+  // ------------------------------------------------
+  // ✅ SEND / MARK PAID / CANCEL (auth + org access)
+  // ------------------------------------------------
   async send(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (
       invoice.status === InvoiceStatus.PAID ||
@@ -1021,10 +825,7 @@ export class InvoicesService {
 
     const updated = await this.prisma.invoice.update({
       where: { id },
-      data: {
-        status: InvoiceStatus.SENT,
-        sentAt: new Date(),
-      },
+      data: { status: InvoiceStatus.SENT, sentAt: new Date() },
       include: { items: true, client: true },
     });
 
@@ -1041,12 +842,12 @@ export class InvoicesService {
   }
 
   async markPaid(authUserId: string, id: string, dto: MarkInvoicePaidDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (invoice.status === InvoiceStatus.CANCELLED) {
       throw new BadRequestException('Скасований інвойс не можна оплатити');
@@ -1065,10 +866,7 @@ export class InvoicesService {
 
     const updated = await this.prisma.invoice.update({
       where: { id },
-      data: {
-        status: InvoiceStatus.PAID,
-        paidAt,
-      },
+      data: { status: InvoiceStatus.PAID, paidAt },
       include: { items: true, client: true },
     });
 
@@ -1085,12 +883,12 @@ export class InvoicesService {
   }
 
   async cancel(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (invoice.status === InvoiceStatus.PAID) {
       throw new BadRequestException('Оплачений інвойс не можна скасувати');
@@ -1120,9 +918,12 @@ export class InvoicesService {
     return updated;
   }
 
-  // =========================
-  // ✅ ANALYTICS — PRO ONLY + AUTH + ORG ACCESS
-  // =========================
+  // ------------------------------------------------
+  // ✅ ANALYTICS (auth + org access) — BASIC/PRO per your plans
+  // (FREE can be allowed or blocked; your PLANS says "expanded analytics" only PRO,
+  // so here I block analytics on FREE. BASIC you listed as blocked too; so PRO only.
+  // If you want BASIC analytics later — change to plan !== FREE.
+  // ------------------------------------------------
   async getAnalytics(params: {
     authUserId: string;
     organizationId: string;
@@ -1135,14 +936,13 @@ export class InvoicesService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertOrgAccess(dbUserId, organizationId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
 
-    const planId = await this.getUserPlanId(dbUserId);
-    if (!this.canViewAnalytics(planId)) {
-      throw new ForbiddenException(
-        `Аналітика доступна лише в плані PRO. Поточний план: ${planId}`,
-      );
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    // Your PLANS: analytics is in PRO features; BASIC says blocked
+    if (planId !== 'PRO') {
+      throw new BadRequestException('Analytics is available on PRO');
     }
 
     const now = new Date();
@@ -1194,11 +994,11 @@ export class InvoicesService {
       return `${y}-${m.toString().padStart(2, '0')}`;
     };
 
-    let currencyOut: string | null = null;
+    let currency: string | null = null;
 
     for (const inv of invoices) {
       const amount = toNumber(inv.total);
-      currencyOut = currencyOut || inv.currency || null;
+      currency = currency || inv.currency || null;
 
       if (inv.status === InvoiceStatus.PAID) totalPaid += amount;
       if (
@@ -1232,7 +1032,7 @@ export class InvoicesService {
     return {
       from: dateFrom.toISOString(),
       to: dateTo.toISOString(),
-      currency: currencyOut || 'UAH',
+      currency: currency || 'UAH',
       totals: {
         paid: totalPaid,
         outstanding: totalOutstanding,
@@ -1240,36 +1040,5 @@ export class InvoicesService {
       },
       monthly,
     };
-  }
-
-  // =========================
-  // ✅ PDF ACCESS HELPERS (AUTH + ORG ACCESS)
-  // =========================
-  async getPdfUa(authUserId: string, invoiceId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id: invoiceId },
-      select: { organizationId: true },
-    });
-    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
-
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
-
-    return this.invoicePdf.getOrCreatePdfForInvoiceUa(invoiceId);
-  }
-
-  async getPdfInternational(authUserId: string, invoiceId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id: invoiceId },
-      select: { organizationId: true },
-    });
-    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
-
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
-
-    return this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoiceId);
   }
 }

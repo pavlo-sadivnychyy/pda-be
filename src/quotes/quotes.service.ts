@@ -3,7 +3,6 @@ import {
   Injectable,
   NotFoundException,
   InternalServerErrorException,
-  ForbiddenException,
 } from '@nestjs/common';
 import {
   Prisma,
@@ -11,7 +10,6 @@ import {
   InvoiceStatus,
   ActivityEntityType,
   ActivityEventType,
-  PlanId,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
@@ -19,6 +17,7 @@ import { CreateQuoteDto } from './dto/create-quote.dto';
 import { UpdateQuoteDto } from './dto/update-quote.dto';
 import { QuotePdfService } from './quote-pdf.service';
 import { ActivityService } from '../activity/activity.service';
+import { PlanService } from '../plan/plan.service';
 
 @Injectable()
 export class QuotesService {
@@ -27,86 +26,12 @@ export class QuotesService {
     private readonly email: EmailService,
     private readonly quotePdf: QuotePdfService,
     private readonly activity: ActivityService,
+    private readonly plan: PlanService,
   ) {}
 
   // =========================
-  // ✅ AUTH/ORG/PLAN HELPERS
+  // ✅ HELPERS
   // =========================
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
-
-  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
-    const sub = await this.prisma.subscription.findUnique({
-      where: { userId: dbUserId },
-      select: { planId: true },
-    });
-    return (sub?.planId as PlanId) ?? PlanId.FREE;
-  }
-
-  // ✅ Quotes are only for BASIC & PRO
-  private async assertQuotesAllowed(dbUserId: string) {
-    const planId = await this.getUserPlanId(dbUserId);
-    if (planId === PlanId.FREE) {
-      throw new ForbiddenException(
-        'Комерційні пропозиції доступні лише на планах BASIC та PRO. Оновіть підписку.',
-      );
-    }
-  }
-
-  // ✅ owner-only org access (бо members немає)
-  private async assertOrgAccess(dbUserId: string, organizationId: string) {
-    if (!organizationId)
-      throw new BadRequestException('organizationId is required');
-
-    const org = await this.prisma.organization.findUnique({
-      where: { id: organizationId },
-      select: { id: true, ownerId: true },
-    });
-
-    if (!org) throw new BadRequestException('Organization not found');
-
-    if (org.ownerId !== dbUserId) {
-      throw new ForbiddenException('No access to this organization');
-    }
-  }
-
-  private async logStatusChange(params: {
-    organizationId: string;
-    actorUserId: string;
-    entityType: ActivityEntityType;
-    entityId: string;
-    from: any;
-    to: any;
-    meta?: any;
-  }) {
-    if (String(params.from) === String(params.to)) return;
-
-    await this.activity.create({
-      organizationId: params.organizationId,
-      actorUserId: params.actorUserId,
-      entityType: params.entityType,
-      entityId: params.entityId,
-      eventType: ActivityEventType.STATUS_CHANGED,
-      fromStatus: String(params.from),
-      toStatus: String(params.to),
-      meta: params.meta ?? undefined,
-    });
-  }
-
   private parseDate(dateStr?: string): Date | undefined {
     if (!dateStr) return undefined;
     const d = new Date(dateStr);
@@ -177,15 +102,41 @@ export class QuotesService {
     return `${prefix}${String(nextSeq).padStart(4, '0')}`;
   }
 
+  private async logStatusChange(params: {
+    organizationId: string;
+    actorUserId: string;
+    entityType: ActivityEntityType;
+    entityId: string;
+    from: any;
+    to: any;
+    meta?: any;
+  }) {
+    if (String(params.from) === String(params.to)) return;
+
+    await this.activity.create({
+      organizationId: params.organizationId,
+      actorUserId: params.actorUserId,
+      entityType: params.entityType,
+      entityId: params.entityId,
+      eventType: ActivityEventType.STATUS_CHANGED,
+      fromStatus: String(params.from),
+      toStatus: String(params.to),
+      meta: params.meta ?? undefined,
+    });
+  }
+
   // =========================
-  // ✅ CRUD
+  // ✅ CRUD (WITH AUTH + PLAN)
   // =========================
+
   async create(authUserId: string, dto: CreateQuoteDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    // 🔒 Quotes: BASIC/PRO only
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const {
       organizationId,
+      // createdById IGNORE (no spoofing)
+      createdById: _ignoreCreatedById,
       clientId,
       issueDate,
       validUntil,
@@ -199,7 +150,10 @@ export class QuotesService {
       throw new BadRequestException('organizationId is required');
     }
 
-    await this.assertOrgAccess(dbUserId, organizationId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
 
     if (!items || items.length === 0) {
       throw new BadRequestException('items are required');
@@ -219,7 +173,7 @@ export class QuotesService {
         const quote = await this.prisma.quote.create({
           data: {
             organizationId,
-            createdById: dbUserId, // ✅ тільки з токена
+            createdById: dbUserId,
             clientId: clientId ?? null,
             number,
             issueDate: issueDateParsed,
@@ -237,7 +191,7 @@ export class QuotesService {
             emailMessageId: null,
 
             items: {
-              create: items.map((it: any, idx: number) => ({
+              create: items.map((it, idx) => ({
                 name: it.name,
                 description: it.description ?? null,
                 quantity: it.quantity,
@@ -261,9 +215,7 @@ export class QuotesService {
 
         return quote;
       } catch (e: any) {
-        if (this.isUniqueNumberError(e) && attempt < maxAttempts) {
-          continue;
-        }
+        if (this.isUniqueNumberError(e) && attempt < maxAttempts) continue;
         throw e;
       }
     }
@@ -277,15 +229,15 @@ export class QuotesService {
     authUserId: string,
     params: { organizationId: string; status?: QuoteStatus; clientId?: string },
   ) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
-
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
     const { organizationId, status, clientId } = params;
 
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
-    await this.assertOrgAccess(dbUserId, organizationId);
 
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+
+    // навіть якщо FREE — list можна дозволити, але там їх просто не буде
     return this.prisma.quote.findMany({
       where: {
         organizationId,
@@ -298,8 +250,7 @@ export class QuotesService {
   }
 
   async findOne(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const quote = await this.prisma.quote.findUnique({
       where: { id },
@@ -312,14 +263,13 @@ export class QuotesService {
     });
     if (!quote) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, quote.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
 
     return quote;
   }
 
   async update(authUserId: string, id: string, dto: UpdateQuoteDto) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const existing = await this.prisma.quote.findUnique({
       where: { id },
@@ -327,9 +277,11 @@ export class QuotesService {
     });
     if (!existing) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
 
-    const beforeStatus = existing.status;
+    // 🔒 Quotes: BASIC/PRO only
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
 
     const issueDateParsed = dto.issueDate
       ? this.parseDate(dto.issueDate)
@@ -360,12 +312,12 @@ export class QuotesService {
       | undefined;
 
     if (hasItemsUpdate) {
-      const calc = this.calculateTotals(dto.items as any);
+      const calc = this.calculateTotals(dto.items!);
       subtotal = calc.subtotal as any;
       taxAmount = calc.taxAmount as any;
       total = calc.total as any;
 
-      itemsCreate = (dto.items as any).map((it: any, idx: number) => ({
+      itemsCreate = dto.items!.map((it, idx) => ({
         name: it.name,
         description: it.description ?? null,
         quantity: it.quantity,
@@ -375,7 +327,7 @@ export class QuotesService {
       }));
     }
 
-    const updated = await this.prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       if (hasItemsUpdate) {
         await tx.quoteItem.deleteMany({ where: { quoteId: id } });
       }
@@ -400,34 +352,22 @@ export class QuotesService {
         include: { client: true, items: true, organization: true },
       });
     });
-
-    // ✅ STATUS_CHANGED log (якщо реально змінився)
-    if (String(beforeStatus) !== String(updated.status)) {
-      await this.logStatusChange({
-        organizationId: updated.organizationId,
-        actorUserId: dbUserId,
-        entityType: ActivityEntityType.QUOTE,
-        entityId: updated.id,
-        from: beforeStatus,
-        to: updated.status,
-        meta: { quoteNumber: updated.number, via: 'update' },
-      });
-    }
-
-    return updated;
   }
 
   async remove(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
-    const existing = await this.prisma.quote.findUnique({
+    const quote = await this.prisma.quote.findUnique({
       where: { id },
       select: { id: true, organizationId: true },
     });
-    if (!existing) throw new NotFoundException('Quote not found');
+    if (!quote) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
+
+    // 🔒 Quotes: BASIC/PRO only
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
 
     await this.prisma.quoteItem.deleteMany({ where: { quoteId: id } });
     await this.prisma.quote.delete({ where: { id } });
@@ -439,13 +379,15 @@ export class QuotesService {
   // ✅ STATUS
   // =========================
   async markStatus(authUserId: string, id: string, status: QuoteStatus) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const quote = await this.prisma.quote.findUnique({ where: { id } });
     if (!quote) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, quote.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
 
     const before = quote.status;
 
@@ -472,11 +414,10 @@ export class QuotesService {
   }
 
   // =========================
-  // ✅ SEND EMAIL
+  // ✅ SEND EMAIL (BASIC/PRO)
   // =========================
   async sendQuoteByEmail(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const quote = await this.prisma.quote.findUnique({
       where: { id },
@@ -490,7 +431,11 @@ export class QuotesService {
 
     if (!quote) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, quote.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
+    this.plan.assertCanSendEmail(planId);
 
     if (!quote.client || !quote.client.email) {
       throw new BadRequestException(
@@ -499,6 +444,7 @@ export class QuotesService {
     }
 
     const to = quote.client.email.trim();
+
     const orgName = quote.organization?.name || 'Your company';
     const subject = `Commercial Offer ${quote.number} from ${orgName}`;
 
@@ -507,7 +453,7 @@ export class QuotesService {
     ).replace(/\/$/, '');
     const quoteUrl = `${appUrl}/quotes/${quote.id}`;
 
-    // ✅ PDF теж під планом (бо quotes під планом)
+    // ✅ PDF is also part of Quotes feature -> already gated above
     const { pdfBuffer } = await this.quotePdf.getOrCreatePdfForQuote(id);
 
     const money = (v: any) => {
@@ -607,29 +553,10 @@ export class QuotesService {
   }
 
   // =========================
-  // ✅ PDF (guarded)
-  // =========================
-  async getPdf(authUserId: string, quoteId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
-
-    const quote = await this.prisma.quote.findUnique({
-      where: { id: quoteId },
-      select: { id: true, organizationId: true },
-    });
-    if (!quote) throw new NotFoundException('Quote not found');
-
-    await this.assertOrgAccess(dbUserId, quote.organizationId);
-
-    return this.quotePdf.getOrCreatePdfForQuote(quote.id);
-  }
-
-  // =========================
   // ✅ CONVERT TO INVOICE
   // =========================
   async convertToInvoice(authUserId: string, quoteId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-    await this.assertQuotesAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const quote = await this.prisma.quote.findUnique({
       where: { id: quoteId },
@@ -637,7 +564,11 @@ export class QuotesService {
     });
     if (!quote) throw new NotFoundException('Quote not found');
 
-    await this.assertOrgAccess(dbUserId, quote.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
+
+    // Quotes themselves are BASIC/PRO, conversion is allowed on BASIC/PRO too
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
 
     const safeSuffix = quoteId.slice(-4).toUpperCase();
     const invoiceNumber = `INV-CONV-${quote.number}-${safeSuffix}`;
@@ -714,5 +645,25 @@ export class QuotesService {
     });
 
     return invoice;
+  }
+
+  // =========================
+  // ✅ PDF ACCESS (BASIC/PRO)
+  // =========================
+  async getQuotePdf(authUserId: string, quoteId: string) {
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+
+    const quote = await this.prisma.quote.findUnique({
+      where: { id: quoteId },
+      select: { id: true, organizationId: true },
+    });
+    if (!quote) throw new NotFoundException('Quote not found');
+
+    await this.plan.assertOrgAccess(dbUserId, quote.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseQuotes(planId);
+
+    return this.quotePdf.getOrCreatePdfForQuote(quoteId);
   }
 }

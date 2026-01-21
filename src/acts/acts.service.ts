@@ -3,18 +3,17 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
-  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   ActStatus,
   ActivityEntityType,
   ActivityEventType,
-  PlanId,
 } from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { ActPdfService } from './act-pdf.service';
 import { ActivityService } from '../activity/activity.service';
+import { PlanService } from '../plan/plan.service';
 
 type CreateActFromInvoiceInput = {
   invoiceId: string;
@@ -33,6 +32,7 @@ export class ActsService {
     private readonly email: EmailService,
     private readonly actPdf: ActPdfService,
     private readonly activity: ActivityService,
+    private readonly plan: PlanService,
   ) {}
 
   private isUniqueActNumberError(e: any): boolean {
@@ -43,60 +43,6 @@ export class ActsService {
       Array.isArray(e.meta.target) &&
       e.meta.target.includes('number')
     );
-  }
-
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
-
-  // ✅ plan helper
-  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
-    const sub = await this.prisma.subscription.findUnique({
-      where: { userId: dbUserId },
-      select: { planId: true },
-    });
-
-    return (sub?.planId as PlanId) ?? PlanId.FREE;
-  }
-
-  // ✅ Acts are only for BASIC & PRO
-  private async assertActsAllowed(dbUserId: string) {
-    const planId = await this.getUserPlanId(dbUserId);
-    if (planId === PlanId.FREE) {
-      throw new ForbiddenException(
-        'Акти доступні лише на планах BASIC та PRO. Оновіть підписку.',
-      );
-    }
-  }
-
-  // ✅ owner-only org access (бо members немає)
-  private async assertOrgAccess(dbUserId: string, organizationId: string) {
-    if (!organizationId)
-      throw new BadRequestException('organizationId is required');
-
-    const org = await this.prisma.organization.findUnique({
-      where: { id: organizationId },
-      select: { id: true, ownerId: true },
-    });
-
-    if (!org) throw new BadRequestException('Organization not found');
-
-    if (org.ownerId !== dbUserId) {
-      throw new ForbiddenException('No access to this organization');
-    }
   }
 
   private async logStatusChange(params: {
@@ -137,10 +83,12 @@ export class ActsService {
       throw new BadRequestException('Поле number (номер акта) є обовʼязковим');
     }
 
-    const dbUserId = await this.resolveDbUserId(createdByAuthUserId);
+    const createdByUserId =
+      await this.plan.resolveDbUserId(createdByAuthUserId);
+    const planId = await this.plan.getPlanIdForUser(createdByUserId);
 
-    // ✅ plan gate
-    await this.assertActsAllowed(dbUserId);
+    // ✅ Acts only BASIC/PRO
+    this.plan.assertCanUseActs(planId);
 
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
@@ -149,8 +97,8 @@ export class ActsService {
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
-    // ✅ access to org
-    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+    // ✅ org access (owner-only fallback inside PlanService)
+    await this.plan.assertOrgAccess(createdByUserId, invoice.organizationId);
 
     if (!invoice.clientId) {
       throw new BadRequestException(
@@ -177,7 +125,7 @@ export class ActsService {
         data: {
           organizationId: invoice.organizationId,
           clientId: invoice.clientId,
-          createdById: dbUserId,
+          createdById: createdByUserId,
           number: trimmedNumber,
           title: title ?? `Акт наданих послуг за інвойсом № ${invoice.number}`,
           periodFrom: periodFrom ? new Date(periodFrom) : null,
@@ -192,7 +140,7 @@ export class ActsService {
 
       await this.activity.create({
         organizationId: act.organizationId,
-        actorUserId: dbUserId,
+        actorUserId: createdByUserId,
         entityType: ActivityEntityType.ACT,
         entityId: act.id,
         eventType: ActivityEventType.CREATED,
@@ -219,14 +167,11 @@ export class ActsService {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
 
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
 
-    // ✅ plan gate (бо “акти” як функціонал)
-    await this.assertActsAllowed(dbUserId);
-
-    await this.assertOrgAccess(dbUserId, organizationId);
-
-    const items = await this.prisma.act.findMany({
+    // list можна дозволити всім планам (навіть FREE), бо акти можуть бути 0
+    return this.prisma.act.findMany({
       where: { organizationId },
       orderBy: { createdAt: 'desc' },
       include: {
@@ -234,29 +179,28 @@ export class ActsService {
         relatedInvoice: true,
       },
     });
-
-    return { items };
   }
 
   async remove(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
-    // ✅ plan gate
-    await this.assertActsAllowed(dbUserId);
+    const existing = await this.prisma.act.findUnique({
+      where: { id },
+      select: { id: true, organizationId: true },
+    });
 
-    const existing = await this.prisma.act.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Акт не знайдено');
 
-    await this.assertOrgAccess(dbUserId, existing.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, existing.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseActs(planId);
 
     return this.prisma.act.delete({ where: { id } });
   }
 
   async getById(authUserId: string, id: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    // ✅ plan gate
-    await this.assertActsAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const act = await this.prisma.act.findUnique({
       where: { id },
@@ -269,16 +213,32 @@ export class ActsService {
 
     if (!act) throw new NotFoundException('Акт не знайдено');
 
-    await this.assertOrgAccess(dbUserId, act.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, act.organizationId);
 
-    return { act };
+    return act;
+  }
+
+  // ✅ PDF should be gated too (because your plans say "acts + PDF")
+  async getPdf(authUserId: string, actId: string) {
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
+
+    const act = await this.prisma.act.findUnique({
+      where: { id: actId },
+      select: { id: true, organizationId: true },
+    });
+
+    if (!act) throw new NotFoundException('Акт не знайдено');
+
+    await this.plan.assertOrgAccess(dbUserId, act.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseActs(planId);
+
+    return this.actPdf.getOrCreatePdfForAct(act.id);
   }
 
   async sendActByEmail(authUserId: string, actId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    // ✅ plan gate
-    await this.assertActsAllowed(dbUserId);
+    const dbUserId = await this.plan.resolveDbUserId(authUserId);
 
     const act = await this.prisma.act.findUnique({
       where: { id: actId },
@@ -292,7 +252,13 @@ export class ActsService {
 
     if (!act) throw new NotFoundException('Акт не знайдено');
 
-    await this.assertOrgAccess(dbUserId, act.organizationId);
+    await this.plan.assertOrgAccess(dbUserId, act.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+
+    // ✅ BASIC/PRO only + email allowed only BASIC/PRO
+    this.plan.assertCanUseActs(planId);
+    this.plan.assertCanSendEmail(planId);
 
     if (act.status === ActStatus.SIGNED || act.status === ActStatus.CANCELLED) {
       throw new BadRequestException(
@@ -309,7 +275,7 @@ export class ActsService {
     const to = act.client.email.trim();
     const orgName = act.organization?.name || 'Your company';
 
-    // ✅ PDF теж тільки BASIC/PRO (бо загалом акти заборонені на FREE)
+    // ✅ PDF generation is part of the feature, already gated
     const { pdfBuffer } = await this.actPdf.getOrCreatePdfForAct(act.id);
 
     const safeNumber = String(act.number).replace(/[^a-zA-Z0-9\-]/g, '_');
@@ -325,9 +291,7 @@ export class ActsService {
     const html = `
       <div style="font-family: Arial, sans-serif; color: #111827;">
         <h2>Акт наданих послуг</h2>
-
         <p>Вітаємо${greeting ? `, ${greeting}` : ''}!</p>
-
         <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
           <div><b>Акт:</b> № ${act.number}</div>
           ${
@@ -336,14 +300,8 @@ export class ActsService {
               : ''
           }
         </div>
-
-        <p style="margin-top:16px;">
-          PDF акта у вкладенні цього листа.
-        </p>
-
-        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
-          Sent from ${orgName}
-        </p>
+        <p style="margin-top:16px;">PDF акта у вкладенні цього листа.</p>
+        <p style="margin-top:16px;font-size:12px;color:#6b7280;">Sent from ${orgName}</p>
       </div>
     `;
 
@@ -389,23 +347,5 @@ export class ActsService {
     });
 
     return { act: updated };
-  }
-
-  // ✅ PDF download gate (controller буде це викликати)
-  async getPdf(authUserId: string, actId: string) {
-    const dbUserId = await this.resolveDbUserId(authUserId);
-
-    await this.assertActsAllowed(dbUserId);
-
-    const act = await this.prisma.act.findUnique({
-      where: { id: actId },
-      select: { id: true, organizationId: true },
-    });
-
-    if (!act) throw new NotFoundException('Акт не знайдено');
-
-    await this.assertOrgAccess(dbUserId, act.organizationId);
-
-    return this.actPdf.getOrCreatePdfForAct(act.id);
   }
 }

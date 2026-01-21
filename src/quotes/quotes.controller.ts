@@ -12,6 +12,7 @@ import {
   UseGuards,
   Req,
 } from '@nestjs/common';
+import type { Response } from 'express';
 
 import { QuotesService } from './quotes.service';
 import { QuoteStatus } from '@prisma/client';
@@ -67,8 +68,8 @@ export class QuotesController {
 
   @Delete(':id')
   async remove(@Req() req: any, @Param('id') id: string) {
-    const result = await this.quotesService.remove(req.authUserId, id);
-    return result;
+    const res = await this.quotesService.remove(req.authUserId, id);
+    return res;
   }
 
   @Post(':id/send')
@@ -116,10 +117,9 @@ export class QuotesController {
     return { invoice };
   }
 
-  // ✅ PDF (guarded через service)
   @Get(':id/pdf')
-  async getPdf(@Req() req: any, @Param('id') id: string, @Res() res: any) {
-    const { document, pdfBuffer } = await this.quotesService.getPdf(
+  async getPdf(@Req() req: any, @Param('id') id: string, @Res() res: Response) {
+    const { document, pdfBuffer } = await this.quotesService.getQuotePdf(
       req.authUserId,
       id,
     );
@@ -129,7 +129,6 @@ export class QuotesController {
       'Content-Disposition',
       `inline; filename="${document.originalName}"`,
     );
-
     res.end(pdfBuffer);
   }
 }

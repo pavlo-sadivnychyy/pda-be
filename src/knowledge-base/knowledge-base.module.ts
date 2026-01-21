@@ -7,6 +7,7 @@ import { KnowledgeBaseController } from './knowledge-base.controller';
 import { PrismaService } from '../prisma/prisma.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { AiModule } from '../ai/ai.module';
+import { PlanModule } from '../plan/plan.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { AiModule } from '../ai/ai.module';
       storage: multer.memoryStorage(),
     }),
     AiModule,
+    PlanModule,
   ],
   controllers: [KnowledgeBaseController],
   providers: [KnowledgeBaseService, PrismaService, FileStorageService],

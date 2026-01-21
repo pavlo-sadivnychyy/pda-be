@@ -1,119 +1,22 @@
-import {
-  Injectable,
-  NotFoundException,
-  ForbiddenException,
-  BadRequestException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import {
   ChatMessageRole,
   ChatSessionStatus,
   BusinessProfile,
   Organization,
-  PlanId,
 } from '@prisma/client';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { AiService } from '../ai/ai.service';
+import { PlanService } from '../plan/plan.service';
 
 @Injectable()
 export class ChatService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ai: AiService,
+    private readonly plan: PlanService,
   ) {}
-
-  // ✅ clerk authUserId -> db userId
-  private async resolveDbUserId(authUserId: string): Promise<string> {
-    if (!authUserId) throw new BadRequestException('Missing auth user');
-
-    const user = await this.prisma.user.findUnique({
-      where: { authUserId },
-      select: { id: true },
-    });
-
-    if (!user) {
-      throw new BadRequestException(
-        'User not found in DB. Call /users/sync first.',
-      );
-    }
-
-    return user.id;
-  }
-
-  // ✅ plan/quota helpers
-  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
-    const sub = await this.prisma.subscription.findUnique({
-      where: { userId: dbUserId },
-      select: { planId: true },
-    });
-
-    return (sub?.planId as PlanId) ?? PlanId.FREE;
-  }
-
-  private getAiMonthlyLimit(planId: PlanId): number {
-    switch (planId) {
-      case PlanId.FREE:
-        return 5;
-      case PlanId.BASIC:
-        return 50;
-      case PlanId.PRO:
-        return Number.POSITIVE_INFINITY;
-      default:
-        return 5;
-    }
-  }
-
-  private getMonthStartUtc(d = new Date()): Date {
-    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
-  }
-
-  private async assertAiQuota(dbUserId: string) {
-    const planId = await this.getUserPlanId(dbUserId);
-    const limit = this.getAiMonthlyLimit(planId);
-
-    if (!Number.isFinite(limit)) return; // PRO
-
-    const monthStart = this.getMonthStartUtc(new Date());
-
-    // Рахуємо саме "AI replies", бо 1 user message => 1 AI call
-    const used = await this.prisma.chatMessage.count({
-      where: {
-        role: ChatMessageRole.ASSISTANT,
-        createdAt: { gte: monthStart },
-        session: {
-          createdById: dbUserId,
-        },
-      },
-    });
-
-    if (used >= limit) {
-      throw new BadRequestException(
-        `Ліміт AI-асистента для плану ${planId}: ${limit} запитів/місяць. Оновіть підписку, щоб зняти обмеження.`,
-      );
-    }
-  }
-
-  // --------- ORG ACCESS (owner-only) ---------
-
-  private async ensureUserInOrganization(
-    organizationId: string,
-    userId: string,
-  ) {
-    if (!organizationId) {
-      throw new BadRequestException('organizationId is required');
-    }
-
-    const org = await this.prisma.organization.findUnique({
-      where: { id: organizationId },
-      select: { id: true, ownerId: true },
-    });
-
-    if (!org) throw new NotFoundException('Organization not found');
-
-    if (org.ownerId !== userId) {
-      throw new ForbiddenException('No access to this organization');
-    }
-  }
 
   // --------- СЕСІЇ ---------
 
@@ -123,8 +26,8 @@ export class ChatService {
   }) {
     const { organizationId, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
-    await this.ensureUserInOrganization(organizationId, userId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(userId, organizationId);
 
     return this.prisma.chatSession.findMany({
       where: { organizationId },
@@ -136,22 +39,18 @@ export class ChatService {
   async getSessionById(params: { id: string; authUserId: string }) {
     const { id, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id },
       include: {
-        messages: {
-          orderBy: { createdAt: 'asc' },
-        },
+        messages: { orderBy: { createdAt: 'asc' } },
       },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
 
     return session;
   }
@@ -163,48 +62,36 @@ export class ChatService {
   }) {
     const { organizationId, authUserId, title } = params;
 
-    const createdById = await this.resolveDbUserId(authUserId);
-    await this.ensureUserInOrganization(organizationId, createdById);
+    const createdById = await this.plan.resolveDbUserId(authUserId);
+    await this.plan.assertOrgAccess(createdById, organizationId);
 
-    const safeTitle =
-      (title || 'Новий діалог').trim().slice(0, 80) || 'Новий діалог';
-
-    const session = await this.prisma.chatSession.create({
+    return this.prisma.chatSession.create({
       data: {
         organizationId,
         createdById,
-        title: safeTitle,
+        title: title || 'Новий діалог',
         status: ChatSessionStatus.ACTIVE,
       },
     });
-
-    return session;
   }
 
-  // ✅ DELETE session (+ messages) — hard delete
   async deleteSession(params: { sessionId: string; authUserId: string }) {
     const { sessionId, authUserId } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
       select: { id: true, organizationId: true },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
 
     await this.prisma.$transaction([
-      this.prisma.chatMessage.deleteMany({
-        where: { sessionId: session.id },
-      }),
-      this.prisma.chatSession.delete({
-        where: { id: session.id },
-      }),
+      this.prisma.chatMessage.deleteMany({ where: { sessionId: session.id } }),
+      this.prisma.chatSession.delete({ where: { id: session.id } }),
     ]);
 
     return { ok: true };
@@ -219,29 +106,24 @@ export class ChatService {
   }) {
     const { sessionId, authUserId, content } = params;
 
-    const userId = await this.resolveDbUserId(authUserId);
+    const userId = await this.plan.resolveDbUserId(authUserId);
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
     });
 
-    if (!session) {
-      throw new NotFoundException('Chat session not found');
-    }
+    if (!session) throw new NotFoundException('Chat session not found');
 
-    await this.ensureUserInOrganization(session.organizationId, userId);
+    await this.plan.assertOrgAccess(userId, session.organizationId);
 
-    const cleanContent = (content || '').trim();
-    if (!cleanContent) throw new BadRequestException('content is required');
-
-    // ✅ Плановий ліміт (до AI виклику)
-    await this.assertAiQuota(userId);
+    // ✅ AI quota by plan (FREE 5/mo, BASIC 50/mo, PRO ∞)
+    await this.plan.assertAiQuota(userId, session.organizationId);
 
     const userMessage = await this.prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: ChatMessageRole.USER,
-        content: cleanContent,
+        content,
       },
     });
 
@@ -262,7 +144,6 @@ export class ChatService {
     const businessProfile = await this.prisma.businessProfile.findUnique({
       where: { organizationId: session.organizationId },
     });
-
     const organization = await this.prisma.organization.findUnique({
       where: { id: session.organizationId },
     });
@@ -273,7 +154,7 @@ export class ChatService {
 
     const kbChunks = await this.findRelevantChunks({
       organizationId: session.organizationId,
-      query: cleanContent,
+      query: content,
       limit: 8,
     });
 
@@ -293,9 +174,7 @@ export class ChatService {
         sessionId: session.id,
         role: ChatMessageRole.ASSISTANT,
         content: assistantText,
-        metadata: {
-          knowledgeSources: knowledgeSnippets,
-        },
+        metadata: { knowledgeSources: knowledgeSnippets },
       },
     });
 
@@ -304,11 +183,7 @@ export class ChatService {
       data: { updatedAt: new Date() },
     });
 
-    return {
-      userMessage,
-      assistantMessage,
-      knowledgeSnippets,
-    };
+    return { userMessage, assistantMessage, knowledgeSnippets };
   }
 
   // --------- HELPERS ---------
@@ -370,9 +245,7 @@ export class ChatService {
     }
 
     const chunks = await this.prisma.documentChunk.findMany({
-      where: {
-        document: { organizationId, status: 'READY' as any },
-      },
+      where: { document: { organizationId, status: 'READY' as any } },
       include: { document: true },
       take: 1000,
     });

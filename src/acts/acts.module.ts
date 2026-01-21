@@ -6,9 +6,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { EmailModule } from '../email/email.module';
 import { ActivityModule } from '../activity/activity.module';
+import { PlanModule } from '../plan/plan.module';
 
 @Module({
-  imports: [EmailModule, ActivityModule], // ✅ щоб інжектити EmailService
+  imports: [EmailModule, ActivityModule, PlanModule],
   controllers: [ActsController],
   providers: [ActsService, ActPdfService, PrismaService, FileStorageService],
   exports: [ActsService, ActPdfService],

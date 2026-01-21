@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Delete,
   Get,
@@ -10,7 +11,6 @@ import {
   UploadedFile,
   Res,
   UseGuards,
-  Body,
   Req,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -26,18 +26,6 @@ class UploadDocumentDto {
   description?: string;
   language?: string;
   tags?: string; // "tag1, tag2"
-}
-
-class CreateDocumentDto {
-  organizationId: string;
-  title: string;
-  originalName: string;
-  mimeType: string;
-  sizeBytes: number;
-  storageKey: string;
-  description?: string;
-  language?: string;
-  tags?: string[];
 }
 
 function normalizeMulterFilename(name: string) {
@@ -95,9 +83,8 @@ export class KnowledgeBaseController {
   ) {
     const doc = await this.kbService.getDocumentById(req.authUserId, id);
 
-    if (!doc?.storageKey) {
+    if (!doc?.storageKey)
       throw new BadRequestException('Document has no storageKey');
-    }
 
     const { stream, contentType, contentLength } =
       await this.fileStorage.getFileStream(doc.storageKey);
@@ -107,9 +94,7 @@ export class KnowledgeBaseController {
 
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${safeAsciiFallback}"; filename*=UTF-8''${encodeRFC5987(
-        original,
-      )}`,
+      `attachment; filename="${safeAsciiFallback}"; filename*=UTF-8''${encodeRFC5987(original)}`,
     );
 
     res.setHeader(
@@ -127,28 +112,6 @@ export class KnowledgeBaseController {
     });
 
     return stream.pipe(res);
-  }
-
-  // POST /knowledge-base/documents (JSON-only)
-  @Post('documents')
-  async createDocument(@Req() req: any, @Body() body: CreateDocumentDto) {
-    if (!body.organizationId)
-      throw new BadRequestException('organizationId is required');
-
-    const doc = await this.kbService.createDocument(req.authUserId, {
-      organizationId: body.organizationId,
-      createdById: 'IGNORED', // ✅ ігнорується в сервісі
-      title: body.title,
-      originalName: body.originalName,
-      mimeType: body.mimeType,
-      sizeBytes: body.sizeBytes,
-      storageKey: body.storageKey,
-      description: body.description,
-      language: body.language,
-      tags: body.tags ?? [],
-    });
-
-    return { document: doc };
   }
 
   // ✅ Upload: POST /knowledge-base/upload
@@ -172,16 +135,15 @@ export class KnowledgeBaseController {
 
     const originalName = normalizeMulterFilename(file.originalname);
 
-    // 1) upload to storage
+    // 1) storage upload
     const storageKey = await this.fileStorage.uploadFile(
       { ...file, originalname: originalName } as any,
       { organizationId: body.organizationId },
     );
 
-    // 2) create DB doc (createdById береться з токена)
+    // 2) DB record (✅ limits + access enforced inside service)
     const doc = await this.kbService.createDocument(req.authUserId, {
       organizationId: body.organizationId,
-      createdById: 'IGNORED',
       title: body.title || originalName,
       originalName,
       mimeType: file.mimetype,
@@ -222,7 +184,6 @@ export class KnowledgeBaseController {
   // DELETE /knowledge-base/documents/:id
   @Delete('documents/:id')
   async deleteDocument(@Req() req: any, @Param('id') id: string) {
-    const res = await this.kbService.deleteDocument(req.authUserId, id);
-    return res;
+    return this.kbService.deleteDocument(req.authUserId, id);
   }
 }
