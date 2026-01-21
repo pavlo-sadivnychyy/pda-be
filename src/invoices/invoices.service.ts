@@ -3,6 +3,7 @@ import {
   Injectable,
   NotFoundException,
   InternalServerErrorException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -13,6 +14,7 @@ import {
   Prisma,
   ActivityEntityType,
   ActivityEventType,
+  PlanId,
 } from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { InvoicePdfService } from './invoice-pdf.service';
@@ -47,16 +49,38 @@ export class InvoicesService {
     return user.id;
   }
 
+  // ✅ planId
+  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { userId: dbUserId },
+      select: { planId: true },
+    });
+
+    return (sub?.planId as PlanId) ?? PlanId.FREE;
+  }
+
+  // ✅ доступ до організації (membership якщо є, і fallback на owner-only)
   private async assertOrgAccess(dbUserId: string, organizationId: string) {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
 
+    // 1) membership (якщо раптом є)
     const membership = await this.prisma.userOrganization.findUnique({
       where: { userId_organizationId: { userId: dbUserId, organizationId } },
       select: { id: true },
     });
 
-    if (!membership) {
+    if (membership) return;
+
+    // 2) owner-only fallback (твій кейс)
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { ownerId: true },
+    });
+
+    if (!org) throw new BadRequestException('Organization not found');
+
+    if (org.ownerId !== dbUserId) {
       throw new BadRequestException('No access to this organization');
     }
   }
@@ -100,6 +124,86 @@ export class InvoicesService {
       toStatus: String(params.to),
       meta: params.meta ?? undefined,
     });
+  }
+
+  // =========================
+  // ✅ PLAN LIMITS / FEATURES
+  // =========================
+
+  // FREE: до 3 інвойсів (загалом, бо в твоєму тексті без “/місяць”)
+  // BASIC: до 20 інвойсів / місяць
+  // PRO: безліміт
+  private getInvoiceLimit(planId: PlanId): {
+    mode: 'TOTAL' | 'MONTHLY' | 'UNLIMITED';
+    limit?: number;
+  } {
+    switch (planId) {
+      case PlanId.FREE:
+        return { mode: 'TOTAL', limit: 3 };
+      case PlanId.BASIC:
+        return { mode: 'MONTHLY', limit: 20 };
+      case PlanId.PRO:
+        return { mode: 'UNLIMITED' };
+      default:
+        return { mode: 'TOTAL', limit: 3 };
+    }
+  }
+
+  private canSendEmail(planId: PlanId): boolean {
+    return planId === PlanId.BASIC || planId === PlanId.PRO;
+  }
+
+  private canSendReminders(planId: PlanId): boolean {
+    return planId === PlanId.PRO;
+  }
+
+  private canViewAnalytics(planId: PlanId): boolean {
+    return planId === PlanId.PRO;
+  }
+
+  private async assertInvoiceCreateLimit(
+    dbUserId: string,
+    organizationId: string,
+  ) {
+    const planId = await this.getUserPlanId(dbUserId);
+    const rule = this.getInvoiceLimit(planId);
+
+    if (rule.mode === 'UNLIMITED') return;
+
+    if (!rule.limit || rule.limit <= 0) {
+      throw new BadRequestException('Invalid plan limits configuration');
+    }
+
+    if (rule.mode === 'TOTAL') {
+      const total = await this.prisma.invoice.count({
+        where: { organizationId },
+      });
+      if (total >= rule.limit) {
+        throw new BadRequestException(
+          `Ліміт інвойсів для плану ${planId}: дозволено ${rule.limit} (загалом). Оновіть підписку, щоб створювати більше інвойсів.`,
+        );
+      }
+      return;
+    }
+
+    // MONTHLY
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    const monthly = await this.prisma.invoice.count({
+      where: {
+        organizationId,
+        createdAt: { gte: start, lt: end },
+      },
+    });
+
+    if (monthly >= rule.limit) {
+      const ym = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}`;
+      throw new BadRequestException(
+        `Ліміт інвойсів для плану ${planId}: дозволено ${rule.limit} / місяць (місяць ${ym}). Оновіть підписку, щоб створювати більше інвойсів.`,
+      );
+    }
   }
 
   // =========================
@@ -191,7 +295,7 @@ export class InvoicesService {
   }
 
   // =========================
-  // ✅ DEADLINES: SEND REMINDER (with PDF)
+  // ✅ DEADLINES: SEND REMINDER (with PDF) — PRO ONLY
   // =========================
   async sendDeadlineReminder(
     authUserId: string,
@@ -218,6 +322,13 @@ export class InvoicesService {
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
 
     await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    const planId = await this.getUserPlanId(dbUserId);
+    if (!this.canSendReminders(planId)) {
+      throw new ForbiddenException(
+        `Нагадування про оплату доступні лише в плані PRO. Поточний план: ${planId}`,
+      );
+    }
 
     if (!invoice.dueDate) {
       throw new BadRequestException('Invoice dueDate is empty.');
@@ -330,7 +441,6 @@ export class InvoicesService {
       } as any,
     });
 
-    // ✅ Activity log
     await this.activity.create({
       organizationId: invoice.organizationId,
       actorUserId: dbUserId,
@@ -349,9 +459,22 @@ export class InvoicesService {
   }
 
   // =========================
-  // ✅ EXISTING: SEND INVOICE (with PDF + status SENT)
+  // ✅ SEND INVOICE BY EMAIL — BASIC/PRO ONLY + AUTH + ORG ACCESS
   // =========================
-  async sendInvoiceByEmail(id: string, variant: 'ua' | 'international' = 'ua') {
+  async sendInvoiceByEmail(
+    authUserId: string,
+    id: string,
+    variant: 'ua' | 'international' = 'ua',
+  ) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const planId = await this.getUserPlanId(dbUserId);
+    if (!this.canSendEmail(planId)) {
+      throw new ForbiddenException(
+        `Відправка документів на email доступна з плану BASIC. Поточний план: ${planId}`,
+      );
+    }
+
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
       include: {
@@ -364,6 +487,8 @@ export class InvoicesService {
     });
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (
       invoice.status === InvoiceStatus.PAID ||
@@ -416,9 +541,10 @@ export class InvoicesService {
 
     const title = isUa ? 'Рахунок-фактура' : 'Invoice';
     const viewLabel = isUa ? 'Переглянути інвойс' : 'View invoice';
+    const safeNumber = String(invoice.number).replace(/[^a-zA-Z0-9\-]/g, '_');
     const pdfName = isUa
-      ? `invoice-ua-${invoice.number}.pdf`
-      : `invoice-int-${invoice.number}.pdf`;
+      ? `invoice-ua-${safeNumber}.pdf`
+      : `invoice-int-${safeNumber}.pdf`;
 
     const html = `
       <div style="font-family: Arial, sans-serif; color: #111827;">
@@ -472,11 +598,9 @@ export class InvoicesService {
       },
     });
 
-    // ✅ Activity logs
-    // 1) SENT event
     await this.activity.create({
       organizationId: invoice.organizationId,
-      actorUserId: invoice.createdById,
+      actorUserId: dbUserId,
       entityType: ActivityEntityType.INVOICE,
       entityId: invoice.id,
       eventType: ActivityEventType.SENT,
@@ -488,10 +612,9 @@ export class InvoicesService {
       },
     });
 
-    // 2) STATUS_CHANGED (якщо реально змінився)
     await this.logStatusChange({
       organizationId: invoice.organizationId,
-      actorUserId: invoice.createdById,
+      actorUserId: dbUserId,
       invoiceId: invoice.id,
       from: beforeStatus,
       to: InvoiceStatus.SENT,
@@ -501,6 +624,9 @@ export class InvoicesService {
     return updated;
   }
 
+  // =========================
+  // ✅ INVOICE NUMBER / TOTALS
+  // =========================
   private async generateInvoiceNumber(organizationId: string): Promise<string> {
     const year = new Date().getFullYear();
     const prefix = `INV-${year}-`;
@@ -576,6 +702,9 @@ export class InvoicesService {
     };
   }
 
+  // =========================
+  // ✅ CREATE (LIMIT ENFORCED)
+  // =========================
   async create(dto: CreateInvoiceDto, createdByAuthUserId: string) {
     const {
       organizationId,
@@ -596,16 +725,11 @@ export class InvoicesService {
       throw new BadRequestException('auth user id is required');
     }
 
-    const createdByUser = await this.prisma.user.findUnique({
-      where: { authUserId: createdByAuthUserId },
-      select: { id: true },
-    });
+    const createdByUserId = await this.resolveDbUserId(createdByAuthUserId);
+    await this.assertOrgAccess(createdByUserId, organizationId);
 
-    if (!createdByUser) {
-      throw new NotFoundException('User not found (sync user first)');
-    }
-
-    await this.assertOrgAccess(createdByUser.id, organizationId);
+    // ✅ ліміт інвойсів по плану
+    await this.assertInvoiceCreateLimit(createdByUserId, organizationId);
 
     if (!items || items.length === 0) {
       throw new BadRequestException(
@@ -628,7 +752,7 @@ export class InvoicesService {
         const invoice = await this.prisma.invoice.create({
           data: {
             organizationId,
-            createdById: createdByUser.id,
+            createdById: createdByUserId,
             clientId: clientId ?? null,
 
             number,
@@ -663,10 +787,9 @@ export class InvoicesService {
           },
         });
 
-        // ✅ Activity log: CREATED
         await this.activity.create({
           organizationId,
-          actorUserId: createdByUser.id,
+          actorUserId: createdByUserId,
           entityType: ActivityEntityType.INVOICE,
           entityId: invoice.id,
           eventType: ActivityEventType.CREATED,
@@ -687,16 +810,23 @@ export class InvoicesService {
     );
   }
 
+  // =========================
+  // ✅ READ (AUTH + ORG ACCESS)
+  // =========================
   async findAll(params: {
+    authUserId: string;
     organizationId: string;
     status?: InvoiceStatus;
     clientId?: string;
   }) {
-    const { organizationId, status, clientId } = params;
+    const { authUserId, organizationId, status, clientId } = params;
 
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
+
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOrgAccess(dbUserId, organizationId);
 
     return this.prisma.invoice.findMany({
       where: {
@@ -714,7 +844,9 @@ export class InvoicesService {
     });
   }
 
-  async findOne(id: string) {
+  async findOne(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
       include: {
@@ -727,10 +859,17 @@ export class InvoicesService {
       throw new NotFoundException('Інвойс не знайдено');
     }
 
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
     return invoice;
   }
 
-  async update(id: string, dto: UpdateInvoiceDto) {
+  // =========================
+  // ✅ UPDATE/DELETE (AUTH + ORG ACCESS)
+  // =========================
+  async update(authUserId: string, id: string, dto: UpdateInvoiceDto) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const existing = await this.prisma.invoice.findUnique({
       where: { id },
       include: { items: true },
@@ -739,6 +878,8 @@ export class InvoicesService {
     if (!existing) {
       throw new NotFoundException('Інвойс не знайдено');
     }
+
+    await this.assertOrgAccess(dbUserId, existing.organizationId);
 
     const beforeStatus = existing.status;
 
@@ -820,12 +961,11 @@ export class InvoicesService {
       });
     });
 
-    // ✅ Activity log: STATUS_CHANGED (лише якщо реально змінився)
     const afterStatus = updated.status;
     if (String(beforeStatus) !== String(afterStatus)) {
       await this.logStatusChange({
         organizationId: updated.organizationId,
-        actorUserId: updated.createdById,
+        actorUserId: dbUserId,
         invoiceId: updated.id,
         from: beforeStatus,
         to: afterStatus,
@@ -836,7 +976,18 @@ export class InvoicesService {
     return updated;
   }
 
-  async remove(id: string) {
+  async remove(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+      select: { id: true, organizationId: true },
+    });
+
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
     await this.prisma.invoiceItem.deleteMany({
       where: { invoiceId: id },
     });
@@ -846,9 +997,16 @@ export class InvoicesService {
     });
   }
 
-  async send(id: string) {
+  // =========================
+  // ✅ SIMPLE STATUS ACTIONS (AUTH + ORG ACCESS)
+  // =========================
+  async send(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (
       invoice.status === InvoiceStatus.PAID ||
@@ -872,7 +1030,7 @@ export class InvoicesService {
 
     await this.logStatusChange({
       organizationId: updated.organizationId,
-      actorUserId: updated.createdById,
+      actorUserId: dbUserId,
       invoiceId: updated.id,
       from: beforeStatus,
       to: InvoiceStatus.SENT,
@@ -882,9 +1040,13 @@ export class InvoicesService {
     return updated;
   }
 
-  async markPaid(id: string, dto: MarkInvoicePaidDto) {
+  async markPaid(authUserId: string, id: string, dto: MarkInvoicePaidDto) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (invoice.status === InvoiceStatus.CANCELLED) {
       throw new BadRequestException('Скасований інвойс не можна оплатити');
@@ -912,7 +1074,7 @@ export class InvoicesService {
 
     await this.logStatusChange({
       organizationId: updated.organizationId,
-      actorUserId: updated.createdById,
+      actorUserId: dbUserId,
       invoiceId: updated.id,
       from: beforeStatus,
       to: InvoiceStatus.PAID,
@@ -922,9 +1084,13 @@ export class InvoicesService {
     return updated;
   }
 
-  async cancel(id: string) {
+  async cancel(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const invoice = await this.prisma.invoice.findUnique({ where: { id } });
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (invoice.status === InvoiceStatus.PAID) {
       throw new BadRequestException('Оплачений інвойс не можна скасувати');
@@ -944,7 +1110,7 @@ export class InvoicesService {
 
     await this.logStatusChange({
       organizationId: updated.organizationId,
-      actorUserId: updated.createdById,
+      actorUserId: dbUserId,
       invoiceId: updated.id,
       from: beforeStatus,
       to: InvoiceStatus.CANCELLED,
@@ -954,15 +1120,29 @@ export class InvoicesService {
     return updated;
   }
 
+  // =========================
+  // ✅ ANALYTICS — PRO ONLY + AUTH + ORG ACCESS
+  // =========================
   async getAnalytics(params: {
+    authUserId: string;
     organizationId: string;
     from?: string;
     to?: string;
   }) {
-    const { organizationId, from, to } = params;
+    const { authUserId, organizationId, from, to } = params;
 
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
+    }
+
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOrgAccess(dbUserId, organizationId);
+
+    const planId = await this.getUserPlanId(dbUserId);
+    if (!this.canViewAnalytics(planId)) {
+      throw new ForbiddenException(
+        `Аналітика доступна лише в плані PRO. Поточний план: ${planId}`,
+      );
     }
 
     const now = new Date();
@@ -1014,11 +1194,11 @@ export class InvoicesService {
       return `${y}-${m.toString().padStart(2, '0')}`;
     };
 
-    let currency: string | null = null;
+    let currencyOut: string | null = null;
 
     for (const inv of invoices) {
       const amount = toNumber(inv.total);
-      currency = currency || inv.currency || null;
+      currencyOut = currencyOut || inv.currency || null;
 
       if (inv.status === InvoiceStatus.PAID) totalPaid += amount;
       if (
@@ -1052,7 +1232,7 @@ export class InvoicesService {
     return {
       from: dateFrom.toISOString(),
       to: dateTo.toISOString(),
-      currency: currency || 'UAH',
+      currency: currencyOut || 'UAH',
       totals: {
         paid: totalPaid,
         outstanding: totalOutstanding,
@@ -1060,5 +1240,36 @@ export class InvoicesService {
       },
       monthly,
     };
+  }
+
+  // =========================
+  // ✅ PDF ACCESS HELPERS (AUTH + ORG ACCESS)
+  // =========================
+  async getPdfUa(authUserId: string, invoiceId: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      select: { organizationId: true },
+    });
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    return this.invoicePdf.getOrCreatePdfForInvoiceUa(invoiceId);
+  }
+
+  async getPdfInternational(authUserId: string, invoiceId: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      select: { organizationId: true },
+    });
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    return this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoiceId);
   }
 }

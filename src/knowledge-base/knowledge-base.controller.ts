@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  Body,
   Controller,
   Delete,
   Get,
@@ -11,6 +10,8 @@ import {
   UploadedFile,
   Res,
   UseGuards,
+  Body,
+  Req,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
@@ -19,35 +20,27 @@ import { KnowledgeBaseService } from './knowledge-base.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 
+class UploadDocumentDto {
+  organizationId: string;
+  title?: string;
+  description?: string;
+  language?: string;
+  tags?: string; // "tag1, tag2"
+}
+
 class CreateDocumentDto {
   organizationId: string;
-  createdById: string;
-
   title: string;
   originalName: string;
   mimeType: string;
   sizeBytes: number;
-
   storageKey: string;
   description?: string;
   language?: string;
   tags?: string[];
 }
 
-class UploadDocumentDto {
-  organizationId: string;
-  createdById: string;
-
-  title?: string;
-  description?: string;
-  language?: string;
-  // tags прийдуть як строка "tag1, tag2"
-  tags?: string;
-}
-
 function normalizeMulterFilename(name: string) {
-  // Часто приходить latin1 -> перетворюємо у utf8
-  // Якщо вже utf8 — не зламається
   try {
     return Buffer.from(name, 'latin1').toString('utf8');
   } catch {
@@ -71,28 +64,36 @@ export class KnowledgeBaseController {
 
   // GET /knowledge-base/documents?organizationId=...
   @Get('documents')
-  async listDocuments(@Query('organizationId') organizationId?: string) {
-    if (!organizationId) {
+  async listDocuments(
+    @Req() req: any,
+    @Query('organizationId') organizationId?: string,
+  ) {
+    if (!organizationId)
       throw new BadRequestException('organizationId is required');
-    }
 
-    const docs =
-      await this.kbService.listDocumentsForOrganization(organizationId);
+    const docs = await this.kbService.listDocumentsForOrganization(
+      req.authUserId,
+      organizationId,
+    );
 
     return { items: docs };
   }
 
   // GET /knowledge-base/documents/:id
   @Get('documents/:id')
-  async getDocument(@Param('id') id: string) {
-    const doc = await this.kbService.getDocumentById(id);
+  async getDocument(@Req() req: any, @Param('id') id: string) {
+    const doc = await this.kbService.getDocumentById(req.authUserId, id);
     return { document: doc };
   }
 
   // ✅ Download: GET /knowledge-base/documents/:id/download
   @Get('documents/:id/download')
-  async downloadDocument(@Param('id') id: string, @Res() res: Response) {
-    const doc = await this.kbService.getDocumentById(id);
+  async downloadDocument(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Res() res: Response,
+  ) {
+    const doc = await this.kbService.getDocumentById(req.authUserId, id);
 
     if (!doc?.storageKey) {
       throw new BadRequestException('Document has no storageKey');
@@ -121,11 +122,8 @@ export class KnowledgeBaseController {
     }
 
     stream.on('error', () => {
-      if (!res.headersSent) {
-        res.status(500).send('Failed to download file');
-      } else {
-        res.end();
-      }
+      if (!res.headersSent) res.status(500).send('Failed to download file');
+      else res.end();
     });
 
     return stream.pipe(res);
@@ -133,10 +131,13 @@ export class KnowledgeBaseController {
 
   // POST /knowledge-base/documents (JSON-only)
   @Post('documents')
-  async createDocument(@Body() body: CreateDocumentDto) {
-    const doc = await this.kbService.createDocument({
+  async createDocument(@Req() req: any, @Body() body: CreateDocumentDto) {
+    if (!body.organizationId)
+      throw new BadRequestException('organizationId is required');
+
+    const doc = await this.kbService.createDocument(req.authUserId, {
       organizationId: body.organizationId,
-      createdById: body.createdById,
+      createdById: 'IGNORED', // ✅ ігнорується в сервісі
       title: body.title,
       originalName: body.originalName,
       mimeType: body.mimeType,
@@ -154,18 +155,13 @@ export class KnowledgeBaseController {
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
   async uploadDocument(
+    @Req() req: any,
     @UploadedFile() file: Express.Multer.File,
     @Body() body: UploadDocumentDto,
   ) {
-    if (!file) {
-      throw new BadRequestException('File is required');
-    }
-
-    if (!body.organizationId || !body.createdById) {
-      throw new BadRequestException(
-        'organizationId and createdById are required',
-      );
-    }
+    if (!file) throw new BadRequestException('File is required');
+    if (!body.organizationId)
+      throw new BadRequestException('organizationId is required');
 
     const tags: string[] = body.tags
       ? body.tags
@@ -174,19 +170,18 @@ export class KnowledgeBaseController {
           .filter(Boolean)
       : [];
 
-    // ✅ Фікс крякозябр
     const originalName = normalizeMulterFilename(file.originalname);
 
-    // 1) S3 upload
+    // 1) upload to storage
     const storageKey = await this.fileStorage.uploadFile(
       { ...file, originalname: originalName } as any,
       { organizationId: body.organizationId },
     );
 
-    // 2) DB record
-    const doc = await this.kbService.createDocument({
+    // 2) create DB doc (createdById береться з токена)
+    const doc = await this.kbService.createDocument(req.authUserId, {
       organizationId: body.organizationId,
-      createdById: body.createdById,
+      createdById: 'IGNORED',
       title: body.title || originalName,
       originalName,
       mimeType: file.mimetype,
@@ -203,20 +198,19 @@ export class KnowledgeBaseController {
   // GET /knowledge-base/search?organizationId=...&q=...&limit=10
   @Get('search')
   async search(
+    @Req() req: any,
     @Query('organizationId') organizationId?: string,
     @Query('q') q?: string,
     @Query('limit') limitRaw?: string,
   ) {
-    if (!organizationId) {
+    if (!organizationId)
       throw new BadRequestException('organizationId is required');
-    }
-    if (!q) {
-      throw new BadRequestException('q (query) is required');
-    }
+    if (!q) throw new BadRequestException('q (query) is required');
 
     const limit = limitRaw ? Number(limitRaw) || 10 : 10;
 
     const items = await this.kbService.searchInOrganization(
+      req.authUserId,
       organizationId,
       q,
       limit,
@@ -227,8 +221,8 @@ export class KnowledgeBaseController {
 
   // DELETE /knowledge-base/documents/:id
   @Delete('documents/:id')
-  async deleteDocument(@Param('id') id: string) {
-    const res = await this.kbService.deleteDocument(id);
+  async deleteDocument(@Req() req: any, @Param('id') id: string) {
+    const res = await this.kbService.deleteDocument(req.authUserId, id);
     return res;
   }
 }

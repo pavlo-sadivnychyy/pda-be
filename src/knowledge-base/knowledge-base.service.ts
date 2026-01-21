@@ -1,13 +1,16 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { Document, DocumentStatus } from '@prisma/client';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { Document, DocumentStatus, PlanId } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { FileStorageService } from '../file-storage/file-storage.service';
 import { AiService } from '../ai/ai.service';
 
 import * as mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
-
-// PDF.js – стабільний варіант
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 type CreateDocumentInput = {
@@ -25,6 +28,83 @@ type CreateDocumentInput = {
   tags?: string[];
 };
 
+type KbLimits = {
+  // max docs per org
+  maxDocsPerOrg: number;
+  // max file size bytes
+  maxUploadBytes: number;
+  // max chunks returned from search
+  maxSearchLimit: number;
+  // whether embeddings are allowed
+  allowEmbeddings: boolean;
+};
+
+function parseIntSafe(v: any, fallback: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getPlanKbLimits(planId: PlanId): KbLimits {
+  // ✅ один раз налаштовуєш в .env, без коду
+  // KB_LIMITS_FREE='{"maxDocsPerOrg":5,"maxUploadBytes":5242880,"maxSearchLimit":10,"allowEmbeddings":false}'
+  // KB_LIMITS_BASIC='{"maxDocsPerOrg":50,"maxUploadBytes":26214400,"maxSearchLimit":20,"allowEmbeddings":false}'
+  // KB_LIMITS_PRO='{"maxDocsPerOrg":500,"maxUploadBytes":104857600,"maxSearchLimit":50,"allowEmbeddings":true}'
+  const envKey =
+    planId === PlanId.PRO
+      ? 'KB_LIMITS_PRO'
+      : planId === PlanId.BASIC
+        ? 'KB_LIMITS_BASIC'
+        : 'KB_LIMITS_FREE';
+
+  let raw: any = null;
+  try {
+    raw = JSON.parse(process.env[envKey] || '');
+  } catch {
+    raw = null;
+  }
+
+  // ✅ дефолти, якщо env не заданий (робочі, але ти краще задай свої)
+  const defaults: KbLimits =
+    planId === PlanId.PRO
+      ? {
+          maxDocsPerOrg: 500,
+          maxUploadBytes: 100 * 1024 * 1024,
+          maxSearchLimit: 50,
+          allowEmbeddings: true,
+        }
+      : planId === PlanId.BASIC
+        ? {
+            maxDocsPerOrg: 50,
+            maxUploadBytes: 25 * 1024 * 1024,
+            maxSearchLimit: 20,
+            allowEmbeddings: false,
+          }
+        : {
+            maxDocsPerOrg: 5,
+            maxUploadBytes: 5 * 1024 * 1024,
+            maxSearchLimit: 10,
+            allowEmbeddings: false,
+          };
+
+  const merged = {
+    ...defaults,
+    ...(raw && typeof raw === 'object' ? raw : {}),
+  };
+
+  return {
+    maxDocsPerOrg: parseIntSafe(merged.maxDocsPerOrg, defaults.maxDocsPerOrg),
+    maxUploadBytes: parseIntSafe(
+      merged.maxUploadBytes,
+      defaults.maxUploadBytes,
+    ),
+    maxSearchLimit: parseIntSafe(
+      merged.maxSearchLimit,
+      defaults.maxSearchLimit,
+    ),
+    allowEmbeddings: Boolean(merged.allowEmbeddings),
+  };
+}
+
 async function extractPdfText(buffer: Buffer): Promise<string> {
   const loadingTask = (pdfjs as any).getDocument({
     data: new Uint8Array(buffer),
@@ -32,7 +112,6 @@ async function extractPdfText(buffer: Buffer): Promise<string> {
   });
 
   const pdf = await loadingTask.promise;
-
   const pages: string[] = [];
 
   for (let i = 1; i <= pdf.numPages; i++) {
@@ -54,44 +133,132 @@ async function extractPdfText(buffer: Buffer): Promise<string> {
 
 @Injectable()
 export class KnowledgeBaseService {
-  private readonly enableEmbeddings: boolean;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly fileStorage: FileStorageService,
     private readonly ai: AiService,
-  ) {
-    this.enableEmbeddings =
-      (process.env.KB_ENABLE_EMBEDDINGS || 'false').toLowerCase() === 'true';
+  ) {}
+
+  // =========================
+  // ✅ AUTH / OWNER / PLAN
+  // =========================
+  private async resolveDbUserId(authUserId: string): Promise<string> {
+    if (!authUserId) throw new BadRequestException('Missing auth user');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'User not found in DB. Call /users/sync first.',
+      );
+    }
+
+    return user.id;
   }
 
-  // ---------- PUBLIC ----------
+  private async assertOwnerAccess(dbUserId: string, organizationId: string) {
+    if (!organizationId)
+      throw new BadRequestException('organizationId is required');
 
-  async listDocumentsForOrganization(organizationId: string) {
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true, ownerId: true },
+    });
+
+    if (!org) throw new BadRequestException('Organization not found');
+    if (org.ownerId !== dbUserId) {
+      throw new ForbiddenException('No access to this organization');
+    }
+  }
+
+  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { userId: dbUserId },
+      select: { planId: true },
+    });
+    return (sub?.planId as PlanId) ?? PlanId.FREE;
+  }
+
+  private async getKbLimitsForAuthUser(authUserId: string): Promise<KbLimits> {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    const planId = await this.getUserPlanId(dbUserId);
+    return getPlanKbLimits(planId);
+  }
+
+  private async assertUploadLimits(params: {
+    organizationId: string;
+    sizeBytes: number;
+    limits: KbLimits;
+  }) {
+    const { organizationId, sizeBytes, limits } = params;
+
+    if (sizeBytes > limits.maxUploadBytes) {
+      throw new ForbiddenException(
+        `Файл завеликий для вашого плану. Max: ${limits.maxUploadBytes} bytes.`,
+      );
+    }
+
+    const docsCount = await this.prisma.document.count({
+      where: { organizationId },
+    });
+
+    if (docsCount >= limits.maxDocsPerOrg) {
+      throw new ForbiddenException(
+        `Ліміт документів досягнуто для вашого плану. Max: ${limits.maxDocsPerOrg}.`,
+      );
+    }
+  }
+
+  // =========================
+  // ✅ PUBLIC API (guarded by controller)
+  // =========================
+
+  async listDocumentsForOrganization(
+    authUserId: string,
+    organizationId: string,
+  ) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOwnerAccess(dbUserId, organizationId);
+
     return this.prisma.document.findMany({
       where: { organizationId },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async getDocumentById(id: string) {
+  async getDocumentById(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
     const doc = await this.prisma.document.findUnique({
       where: { id },
       include: { chunks: true },
     });
 
-    if (!doc) {
-      throw new NotFoundException('Document not found');
-    }
+    if (!doc) throw new NotFoundException('Document not found');
+
+    await this.assertOwnerAccess(dbUserId, doc.organizationId);
 
     return doc;
   }
 
-  async createDocument(input: CreateDocumentInput) {
+  async createDocument(authUserId: string, input: CreateDocumentInput) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOwnerAccess(dbUserId, input.organizationId);
+
+    const limits = await this.getKbLimitsForAuthUser(authUserId);
+    await this.assertUploadLimits({
+      organizationId: input.organizationId,
+      sizeBytes: input.sizeBytes,
+      limits,
+    });
+
     const doc = await this.prisma.document.create({
       data: {
         organizationId: input.organizationId,
-        createdById: input.createdById,
+        createdById: dbUserId, // ✅ тільки з токена
         title: input.title,
         originalName: input.originalName,
         mimeType: input.mimeType,
@@ -104,31 +271,49 @@ export class KnowledgeBaseService {
       },
     });
 
-    this.processDocumentFile(doc).catch((err) =>
+    // ✅ обробка асинхронно як було
+    this.processDocumentFile(doc, limits).catch((err) =>
       console.error('[KB] processDocumentFile error', doc.id, err),
     );
 
     return doc;
   }
 
-  async deleteDocument(id: string) {
-    await this.prisma.documentChunk.deleteMany({
-      where: { documentId: id },
+  async deleteDocument(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    const doc = await this.prisma.document.findUnique({
+      where: { id },
+      select: { id: true, organizationId: true, storageKey: true },
     });
 
-    await this.prisma.document.delete({
-      where: { id },
-    });
+    if (!doc) throw new NotFoundException('Document not found');
+
+    await this.assertOwnerAccess(dbUserId, doc.organizationId);
+
+    await this.prisma.documentChunk.deleteMany({ where: { documentId: id } });
+    await this.prisma.document.delete({ where: { id } });
+
+    // (опціонально) видалити файл зі сховища, якщо треба:
+    // if (doc.storageKey) await this.fileStorage.deleteFile(doc.storageKey);
 
     return { success: true };
   }
 
   async searchInOrganization(
+    authUserId: string,
     organizationId: string,
     query: string,
     limit = 10,
   ) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+    await this.assertOwnerAccess(dbUserId, organizationId);
+
+    const limits = await this.getKbLimitsForAuthUser(authUserId);
+
     if (!query.trim()) return [];
+
+    const take = Math.min(Math.max(limit, 1), limits.maxSearchLimit);
 
     return this.prisma.documentChunk.findMany({
       where: {
@@ -136,14 +321,15 @@ export class KnowledgeBaseService {
         content: { contains: query, mode: 'insensitive' },
       },
       include: { document: true },
-      take: limit,
+      take,
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  // ---------- PROCESSING ----------
-
-  private async processDocumentFile(doc: Document) {
+  // =========================
+  // ✅ PROCESSING
+  // =========================
+  private async processDocumentFile(doc: Document, limits: KbLimits) {
     try {
       const buffer = await this.fileStorage.getFile(doc.storageKey);
 
@@ -162,7 +348,7 @@ export class KnowledgeBaseService {
       const chunks = this.splitTextIntoChunks(text, 1000);
 
       let embeddings: number[][] = [];
-      if (this.enableEmbeddings && chunks.length) {
+      if (limits.allowEmbeddings && chunks.length) {
         try {
           embeddings = await this.ai.createEmbeddings(chunks);
         } catch {
@@ -211,18 +397,15 @@ export class KnowledgeBaseService {
     const mt = (mimeType || '').toLowerCase();
     const name = (originalName || '').toLowerCase();
 
-    // PDF
     if (mt.includes('pdf') || name.endsWith('.pdf')) {
       return extractPdfText(buffer);
     }
 
-    // DOCX
     if (mt.includes('word') || name.endsWith('.docx')) {
       const res = await mammoth.extractRawText({ buffer });
       return res.value || '';
     }
 
-    // XLSX / XLS
     if (
       mt.includes('excel') ||
       name.endsWith('.xlsx') ||
@@ -247,7 +430,6 @@ export class KnowledgeBaseService {
       return parts.join('\n');
     }
 
-    // TXT
     return buffer.toString('utf-8');
   }
 

@@ -14,9 +14,10 @@ import { ActivityModule } from '../activity/activity.module';
   controllers: [QuotesController],
   providers: [
     PrismaService,
-    FileStorageService, // ✅ Ось це треба, бо модулю нема
+    FileStorageService,
     QuotesService,
     QuotePdfService,
   ],
+  exports: [QuotesService, QuotePdfService],
 })
 export class QuotesModule {}

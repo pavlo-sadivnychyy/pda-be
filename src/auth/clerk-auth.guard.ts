@@ -19,7 +19,7 @@ function extractBearer(req: any): string | null {
 export class ClerkAuthGuard implements CanActivate {
   private clerk = createClerkClient({
     secretKey: process.env.CLERK_SECRET_KEY!,
-    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!, // ✅ додали
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
   });
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
@@ -55,9 +55,11 @@ export class ClerkAuthGuard implements CanActivate {
         ? auth.sessionId
         : null;
 
-    if (!userId)
+    if (!userId) {
       throw new UnauthorizedException('Invalid or expired Clerk token');
+    }
 
+    // ✅ тільки те, що точно можемо гарантувати без БД
     req.authUserId = userId;
     req.authSessionId = sessionId ?? null;
     req.clerkAuth = auth;

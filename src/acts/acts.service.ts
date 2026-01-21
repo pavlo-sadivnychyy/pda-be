@@ -3,12 +3,14 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   ActStatus,
   ActivityEntityType,
   ActivityEventType,
+  PlanId,
 } from '@prisma/client';
 import { EmailService } from '../email/email.service';
 import { ActPdfService } from './act-pdf.service';
@@ -60,17 +62,40 @@ export class ActsService {
     return user.id;
   }
 
+  // ✅ plan helper
+  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { userId: dbUserId },
+      select: { planId: true },
+    });
+
+    return (sub?.planId as PlanId) ?? PlanId.FREE;
+  }
+
+  // ✅ Acts are only for BASIC & PRO
+  private async assertActsAllowed(dbUserId: string) {
+    const planId = await this.getUserPlanId(dbUserId);
+    if (planId === PlanId.FREE) {
+      throw new ForbiddenException(
+        'Акти доступні лише на планах BASIC та PRO. Оновіть підписку.',
+      );
+    }
+  }
+
+  // ✅ owner-only org access (бо members немає)
   private async assertOrgAccess(dbUserId: string, organizationId: string) {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
 
-    const membership = await this.prisma.userOrganization.findUnique({
-      where: { userId_organizationId: { userId: dbUserId, organizationId } },
-      select: { id: true },
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true, ownerId: true },
     });
 
-    if (!membership) {
-      throw new BadRequestException('No access to this organization');
+    if (!org) throw new BadRequestException('Organization not found');
+
+    if (org.ownerId !== dbUserId) {
+      throw new ForbiddenException('No access to this organization');
     }
   }
 
@@ -112,14 +137,10 @@ export class ActsService {
       throw new BadRequestException('Поле number (номер акта) є обовʼязковим');
     }
 
-    const createdByUser = await this.prisma.user.findUnique({
-      where: { authUserId: createdByAuthUserId },
-      select: { id: true },
-    });
+    const dbUserId = await this.resolveDbUserId(createdByAuthUserId);
 
-    if (!createdByUser) {
-      throw new NotFoundException('User not found (sync user first)');
-    }
+    // ✅ plan gate
+    await this.assertActsAllowed(dbUserId);
 
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
@@ -127,6 +148,9 @@ export class ActsService {
     });
 
     if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    // ✅ access to org
+    await this.assertOrgAccess(dbUserId, invoice.organizationId);
 
     if (!invoice.clientId) {
       throw new BadRequestException(
@@ -153,7 +177,7 @@ export class ActsService {
         data: {
           organizationId: invoice.organizationId,
           clientId: invoice.clientId,
-          createdById: createdByUser.id,
+          createdById: dbUserId,
           number: trimmedNumber,
           title: title ?? `Акт наданих послуг за інвойсом № ${invoice.number}`,
           periodFrom: periodFrom ? new Date(periodFrom) : null,
@@ -168,7 +192,7 @@ export class ActsService {
 
       await this.activity.create({
         organizationId: act.organizationId,
-        actorUserId: createdByUser.id,
+        actorUserId: dbUserId,
         entityType: ActivityEntityType.ACT,
         entityId: act.id,
         eventType: ActivityEventType.CREATED,
@@ -190,10 +214,17 @@ export class ActsService {
     }
   }
 
-  async listForOrganization(organizationId: string) {
+  async listForOrganization(authUserId: string, organizationId: string) {
     if (!organizationId) {
       throw new BadRequestException('organizationId є обовʼязковим');
     }
+
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    // ✅ plan gate (бо “акти” як функціонал)
+    await this.assertActsAllowed(dbUserId);
+
+    await this.assertOrgAccess(dbUserId, organizationId);
 
     const items = await this.prisma.act.findMany({
       where: { organizationId },
@@ -207,13 +238,26 @@ export class ActsService {
     return { items };
   }
 
-  async remove(id: string) {
+  async remove(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    // ✅ plan gate
+    await this.assertActsAllowed(dbUserId);
+
     const existing = await this.prisma.act.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Акт не знайдено');
+
+    await this.assertOrgAccess(dbUserId, existing.organizationId);
+
     return this.prisma.act.delete({ where: { id } });
   }
 
-  async getById(id: string) {
+  async getById(authUserId: string, id: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    // ✅ plan gate
+    await this.assertActsAllowed(dbUserId);
+
     const act = await this.prisma.act.findUnique({
       where: { id },
       include: {
@@ -224,11 +268,17 @@ export class ActsService {
     });
 
     if (!act) throw new NotFoundException('Акт не знайдено');
+
+    await this.assertOrgAccess(dbUserId, act.organizationId);
+
     return { act };
   }
 
   async sendActByEmail(authUserId: string, actId: string) {
     const dbUserId = await this.resolveDbUserId(authUserId);
+
+    // ✅ plan gate
+    await this.assertActsAllowed(dbUserId);
 
     const act = await this.prisma.act.findUnique({
       where: { id: actId },
@@ -259,6 +309,7 @@ export class ActsService {
     const to = act.client.email.trim();
     const orgName = act.organization?.name || 'Your company';
 
+    // ✅ PDF теж тільки BASIC/PRO (бо загалом акти заборонені на FREE)
     const { pdfBuffer } = await this.actPdf.getOrCreatePdfForAct(act.id);
 
     const safeNumber = String(act.number).replace(/[^a-zA-Z0-9\-]/g, '_');
@@ -338,5 +389,23 @@ export class ActsService {
     });
 
     return { act: updated };
+  }
+
+  // ✅ PDF download gate (controller буде це викликати)
+  async getPdf(authUserId: string, actId: string) {
+    const dbUserId = await this.resolveDbUserId(authUserId);
+
+    await this.assertActsAllowed(dbUserId);
+
+    const act = await this.prisma.act.findUnique({
+      where: { id: actId },
+      select: { id: true, organizationId: true },
+    });
+
+    if (!act) throw new NotFoundException('Акт не знайдено');
+
+    await this.assertOrgAccess(dbUserId, act.organizationId);
+
+    return this.actPdf.getOrCreatePdfForAct(act.id);
   }
 }

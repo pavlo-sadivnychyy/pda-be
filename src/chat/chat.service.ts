@@ -9,6 +9,7 @@ import {
   ChatSessionStatus,
   BusinessProfile,
   Organization,
+  PlanId,
 } from '@prisma/client';
 
 import { PrismaService } from '../prisma/prisma.service';
@@ -37,6 +38,81 @@ export class ChatService {
     }
 
     return user.id;
+  }
+
+  // ✅ plan/quota helpers
+  private async getUserPlanId(dbUserId: string): Promise<PlanId> {
+    const sub = await this.prisma.subscription.findUnique({
+      where: { userId: dbUserId },
+      select: { planId: true },
+    });
+
+    return (sub?.planId as PlanId) ?? PlanId.FREE;
+  }
+
+  private getAiMonthlyLimit(planId: PlanId): number {
+    switch (planId) {
+      case PlanId.FREE:
+        return 5;
+      case PlanId.BASIC:
+        return 50;
+      case PlanId.PRO:
+        return Number.POSITIVE_INFINITY;
+      default:
+        return 5;
+    }
+  }
+
+  private getMonthStartUtc(d = new Date()): Date {
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
+  }
+
+  private async assertAiQuota(dbUserId: string) {
+    const planId = await this.getUserPlanId(dbUserId);
+    const limit = this.getAiMonthlyLimit(planId);
+
+    if (!Number.isFinite(limit)) return; // PRO
+
+    const monthStart = this.getMonthStartUtc(new Date());
+
+    // Рахуємо саме "AI replies", бо 1 user message => 1 AI call
+    const used = await this.prisma.chatMessage.count({
+      where: {
+        role: ChatMessageRole.ASSISTANT,
+        createdAt: { gte: monthStart },
+        session: {
+          createdById: dbUserId,
+        },
+      },
+    });
+
+    if (used >= limit) {
+      throw new BadRequestException(
+        `Ліміт AI-асистента для плану ${planId}: ${limit} запитів/місяць. Оновіть підписку, щоб зняти обмеження.`,
+      );
+    }
+  }
+
+  // --------- ORG ACCESS (owner-only) ---------
+
+  private async ensureUserInOrganization(
+    organizationId: string,
+    userId: string,
+  ) {
+    if (!organizationId) {
+      throw new BadRequestException('organizationId is required');
+    }
+
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true, ownerId: true },
+    });
+
+    if (!org) throw new NotFoundException('Organization not found');
+
+    if (org.ownerId !== userId) {
+      throw new ForbiddenException('No access to this organization');
+    }
   }
 
   // --------- СЕСІЇ ---------
@@ -90,11 +166,14 @@ export class ChatService {
     const createdById = await this.resolveDbUserId(authUserId);
     await this.ensureUserInOrganization(organizationId, createdById);
 
+    const safeTitle =
+      (title || 'Новий діалог').trim().slice(0, 80) || 'Новий діалог';
+
     const session = await this.prisma.chatSession.create({
       data: {
         organizationId,
         createdById,
-        title: title || 'Новий діалог',
+        title: safeTitle,
         status: ChatSessionStatus.ACTIVE,
       },
     });
@@ -152,11 +231,17 @@ export class ChatService {
 
     await this.ensureUserInOrganization(session.organizationId, userId);
 
+    const cleanContent = (content || '').trim();
+    if (!cleanContent) throw new BadRequestException('content is required');
+
+    // ✅ Плановий ліміт (до AI виклику)
+    await this.assertAiQuota(userId);
+
     const userMessage = await this.prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: ChatMessageRole.USER,
-        content,
+        content: cleanContent,
       },
     });
 
@@ -177,6 +262,7 @@ export class ChatService {
     const businessProfile = await this.prisma.businessProfile.findUnique({
       where: { organizationId: session.organizationId },
     });
+
     const organization = await this.prisma.organization.findUnique({
       where: { id: session.organizationId },
     });
@@ -187,7 +273,7 @@ export class ChatService {
 
     const kbChunks = await this.findRelevantChunks({
       organizationId: session.organizationId,
-      query: content,
+      query: cleanContent,
       limit: 8,
     });
 
@@ -226,19 +312,6 @@ export class ChatService {
   }
 
   // --------- HELPERS ---------
-
-  private async ensureUserInOrganization(
-    organizationId: string,
-    userId: string,
-  ) {
-    const membership = await this.prisma.userOrganization.findFirst({
-      where: { organizationId, userId },
-    });
-
-    if (!membership) {
-      throw new ForbiddenException('User does not belong to this organization');
-    }
-  }
 
   private buildBusinessContext(
     profile: BusinessProfile | null,

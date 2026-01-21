@@ -1,4 +1,3 @@
-// knowledge-base.module.ts
 import { Module } from '@nestjs/common';
 import { MulterModule } from '@nestjs/platform-express';
 import multer from 'multer';
