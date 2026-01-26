@@ -13,6 +13,8 @@ import { ClientsModule } from './clients/clients.module';
 import { ActsModule } from './acts/acts.module';
 import { QuotesModule } from './quotes/quotes.module';
 import { ActivityModule } from './activity/activity.module';
+import { BillingModule } from './billing/billing.module';
+import { ServicesModule } from './services/services.module';
 
 @Module({
   imports: [
@@ -27,6 +29,8 @@ import { ActivityModule } from './activity/activity.module';
     QuotesModule,
     InvoicesModule,
     ActivityModule,
+    BillingModule,
+    ServicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
   ],
   controllers: [AppController],

@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import * as process from 'node:process';
+import * as bodyParser from 'body-parser';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -27,6 +28,13 @@ async function bootstrap() {
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
+  app.use(bodyParser.json());
+
+  // RAW тільки для вебхука
+  app.use(
+    '/billing/monobank/webhook',
+    bodyParser.raw({ type: 'application/json' }),
+  );
 
   await app.listen(process.env.PORT || 3000);
 }
