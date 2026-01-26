@@ -6,6 +6,8 @@ import {
   Req,
   UseGuards,
   BadRequestException,
+  Headers,
+  HttpCode,
 } from '@nestjs/common';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { PlanId } from '@prisma/client';
@@ -42,11 +44,33 @@ export class BillingController {
     return this.billing.getMySubscription(req.authUserId);
   }
 
-  // 3) Webhook (без auth guard!)
+  /**
+   * 3) Webhook (без auth guard!)
+   *
+   * Важливо:
+   * - Mono шле підпис в header `X-Sign` (інколи може бути `x-sign` — Nest нормалізує).
+   * - Для валідації підпису потрібен *raw body*, а не JSON, інакше підпис не зійдеться.
+   *
+   * Тому в main.ts має бути увімкнений rawBody:
+   *   app.use(bodyParser.json({ verify: (req: any, _res, buf) => (req.rawBody = buf) }));
+   *   app.use(bodyParser.urlencoded({ verify: (req: any, _res, buf) => (req.rawBody = buf), extended: true }));
+   */
   @Post('monobank/webhook')
-  async monobankWebhook(@Req() req: any) {
-    // тут req.body буде Buffer (raw)
-    await this.billing.handleMonobankWebhook(req);
+  @HttpCode(200) // Mono очікує 200 OK
+  async monobankWebhook(
+    @Req() req: any,
+    @Headers('x-sign') xSign?: string,
+    @Headers('x-request-id') xRequestId?: string,
+  ) {
+    // прокинемо корисні речі в сервіс без “магії”
+    await this.billing.handleMonobankWebhook({
+      rawBody: req.rawBody ?? req.body, // req.body може бути Buffer, але краще rawBody
+      headers: {
+        xSign,
+        xRequestId,
+      },
+    });
+
     return { ok: true };
   }
 }
