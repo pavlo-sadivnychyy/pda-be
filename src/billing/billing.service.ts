@@ -39,7 +39,7 @@ export class BillingService {
 
     const amount = this.planPriceUahKop(input.planId);
 
-    const redirectUrl = `${process.env.APP_PUBLIC_URL}/dashboard`;
+    const redirectUrl = `${process.env.APP_PUBLIC_URL}/pricing`;
     const webHookUrl = `${process.env.API_PUBLIC_URL}${process.env.MONO_WEBHOOK_PATH}`;
 
     const { data } = await this.mono.post('/api/merchant/subscription/create', {
