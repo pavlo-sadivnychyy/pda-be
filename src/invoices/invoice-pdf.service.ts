@@ -19,14 +19,14 @@ export class InvoicePdfService {
     if (typeof value === 'number') return value.toFixed(2);
     if (typeof value === 'string') {
       const num = parseFloat(value);
-      return isNaN(num) ? value : num.toFixed(2);
+      return Number.isFinite(num) ? num.toFixed(2) : value;
     }
     // Prisma.Decimal
     // @ts-ignore
     if (value && typeof value.toNumber === 'function') {
       // @ts-ignore
       const num = value.toNumber();
-      return num.toFixed(2);
+      return Number.isFinite(num) ? num.toFixed(2) : String(value);
     }
     return String(value);
   }
@@ -35,6 +35,16 @@ export class InvoicePdfService {
     const s = (iban ?? '').replace(/\s+/g, '').trim();
     if (!s) return '';
     return s.replace(/(.{4})/g, '$1 ').trim();
+  }
+
+  private formatDateISO(d?: Date | string | null): string {
+    if (!d) return '-';
+    if (typeof d === 'string') return d.slice(0, 10);
+    try {
+      return d.toISOString().slice(0, 10);
+    } catch {
+      return '-';
+    }
   }
 
   // ✅ avoid TS type issues with pdfkit import
@@ -48,243 +58,635 @@ export class InvoicePdfService {
   }
 
   // ===========================
+  // ====== PDF DRAW HELPERS ===
+  // ===========================
+  private setupDoc(): any {
+    const doc = new PDFDocument({
+      size: 'A4',
+      margin: 40,
+    });
+
+    const fontsRoot = path.join(process.cwd(), 'fonts', 'Inter');
+    const interVariablePath = path.join(
+      fontsRoot,
+      'Inter-VariableFont_opsz,wght.ttf',
+    );
+
+    doc.registerFont('Body', interVariablePath);
+    doc.registerFont('BodyBold', interVariablePath);
+
+    doc.font('Body');
+    doc.fontSize(10);
+    doc.fillColor('#000000');
+
+    return doc;
+  }
+
+  private strokeRect(doc: any, x: number, y: number, w: number, h: number) {
+    doc.rect(x, y, w, h).stroke();
+  }
+
+  private drawCell(
+    doc: any,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    text: string,
+    opts?: {
+      bold?: boolean;
+      fontSize?: number;
+      align?: 'left' | 'right' | 'center';
+      valign?: 'top' | 'middle';
+      padding?: number;
+      color?: string;
+      lineGap?: number;
+    },
+  ) {
+    const padding = opts?.padding ?? 6;
+    const fontSize = opts?.fontSize ?? 10;
+    const align = opts?.align ?? 'left';
+    const valign = opts?.valign ?? 'top';
+
+    if (opts?.color) doc.fillColor(opts.color);
+    doc.font(opts?.bold ? 'BodyBold' : 'Body');
+    doc.fontSize(fontSize);
+
+    const textBoxY =
+      valign === 'middle'
+        ? y + Math.max(0, (h - fontSize - 2) / 2)
+        : y + padding;
+
+    doc.text(text ?? '', x + padding, textBoxY, {
+      width: w - padding * 2,
+      height: h - padding * 2,
+      align,
+      lineGap: opts?.lineGap ?? 1,
+    });
+
+    doc.fillColor('#000000');
+    doc.font('Body');
+    doc.fontSize(10);
+  }
+
+  private drawLabelValueBlock(
+    doc: any,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    title: string,
+    lines: string[],
+    lang: 'UA' | 'EN',
+  ) {
+    this.strokeRect(doc, x, y, w, h);
+
+    const titleH = 18;
+    doc
+      .moveTo(x, y + titleH)
+      .lineTo(x + w, y + titleH)
+      .stroke();
+
+    this.drawCell(doc, x, y, w, titleH, title, {
+      bold: true,
+      fontSize: 10.5,
+      valign: 'middle',
+      padding: 6,
+    });
+
+    const bodyText = lines.filter(Boolean).join('\n');
+    this.drawCell(doc, x, y + titleH, w, h - titleH, bodyText, {
+      fontSize: 9.5,
+      padding: 6,
+      lineGap: lang === 'UA' ? 1.2 : 1.15,
+    });
+  }
+
+  private buildSupplierLines(org: any, lang: 'UA' | 'EN'): string[] {
+    const name =
+      org?.beneficiaryName ||
+      org?.legalName ||
+      org?.name ||
+      (lang === 'UA' ? '—' : '—');
+    const address = org?.legalAddress || '';
+    const cityCountry = [org?.city, org?.country].filter(Boolean).join(', ');
+    const reg = org?.registrationNumber || '';
+    const vat = org?.vatId || '';
+
+    const lines: string[] = [];
+    lines.push(name);
+
+    const addrLine = [address, cityCountry].filter(Boolean).join(', ');
+    if (addrLine) lines.push(addrLine);
+
+    if (org?.primaryContactEmail)
+      lines.push(
+        `${lang === 'UA' ? 'Email' : 'Email'}: ${org.primaryContactEmail}`,
+      );
+    if (org?.primaryContactPhone)
+      lines.push(
+        `${lang === 'UA' ? 'Тел' : 'Phone'}: ${org.primaryContactPhone}`,
+      );
+
+    if (reg)
+      lines.push(`${lang === 'UA' ? 'ЄДРПОУ/Reg. No' : 'Reg. No'}: ${reg}`);
+    if (vat) lines.push(`${lang === 'UA' ? 'ІПН/VAT' : 'VAT/Tax ID'}: ${vat}`);
+
+    return lines;
+  }
+
+  private buildBuyerLines(client: any, lang: 'UA' | 'EN'): string[] {
+    if (!client) return [lang === 'UA' ? '—' : '—'];
+
+    const lines: string[] = [];
+    if (client.name) lines.push(client.name);
+    if (client.contactName) lines.push(client.contactName);
+
+    if (client.address) lines.push(client.address);
+    if (client.email) lines.push(client.email);
+    if (client.phone) lines.push(client.phone);
+
+    if (client.taxNumber) {
+      lines.push(
+        `${lang === 'UA' ? 'Податковий номер' : 'Tax ID'}: ${client.taxNumber}`,
+      );
+    }
+
+    return lines.length ? lines : [lang === 'UA' ? '—' : '—'];
+  }
+
+  private buildPaymentLines(
+    org: any,
+    invoice: any,
+    lang: 'UA' | 'EN',
+  ): string[] {
+    const beneficiary =
+      org?.beneficiaryName || org?.legalName || org?.name || '—';
+    const iban = this.formatIban(org?.iban);
+    const swift = org?.swiftBic || org?.swift || '';
+    const bankName = org?.bankName || '';
+    const bankAddr = org?.bankAddress || '';
+    const acc = org?.bankAccountNumber || ''; // якщо маєш окреме поле
+    const reference = (
+      org?.paymentReferenceHint?.trim() ||
+      (lang === 'UA'
+        ? `Оплата за інвойсом № ${invoice?.number ?? ''}`
+        : `Payment for invoice No ${invoice?.number ?? ''}`)
+    ).trim();
+
+    const lines: string[] = [];
+    lines.push(
+      `${lang === 'UA' ? 'Отримувач' : 'Beneficiary'}: ${beneficiary}`,
+    );
+    if (iban) lines.push(`IBAN: ${iban}`);
+    if (acc) lines.push(`${lang === 'UA' ? 'Рахунок' : 'Account'}: ${acc}`);
+    if (swift) lines.push(`SWIFT/BIC: ${swift}`);
+    if (bankName) lines.push(`${lang === 'UA' ? 'Банк' : 'Bank'}: ${bankName}`);
+    if (bankAddr)
+      lines.push(
+        `${lang === 'UA' ? 'Адреса банку' : 'Bank address'}: ${bankAddr}`,
+      );
+    lines.push(`${lang === 'UA' ? 'Призначення' : 'Reference'}: ${reference}`);
+
+    return lines;
+  }
+
+  private buildSubject(invoice: any): string {
+    // Якщо маєш invoice.subject — підстав сюди.
+    // Зараз зробимо “по-простому”: або industry, або “Services”.
+    const org = invoice?.organization ?? {};
+    const fromOrg = (org?.industry || '').trim();
+    if (fromOrg) return fromOrg;
+
+    const firstItem = invoice?.items?.[0]?.name?.trim();
+    if (firstItem) return firstItem;
+
+    return 'Services';
+  }
+
+  private termsEN(invoiceNo: string): string[] {
+    return [
+      `All charges of correspondent banks are at the Seller's expense.`,
+      ``,
+      `Payment hereof at the same time is the evidence of the service delivery, acceptance thereof in full scope and the confirmation of final mutual settlements between Parties.`,
+      ``,
+      `The Parties shall not be liable for non-performance or improper performance of the obligations under the agreement during the term of insuperable force circumstances.`,
+      ``,
+      `Payment according hereto shall be also the confirmation that Parties have no claims to each other and have no intention to submit any claims.`,
+      ``,
+      `Any disputes arising out of the agreement between the Parties shall be settled by the competent court at the location of a defendant.`,
+      ``,
+      `Reference: Invoice No ${invoiceNo}`,
+    ];
+  }
+
+  private termsUA(invoiceNo: string): string[] {
+    return [
+      `Усі комісії банків-кореспондентів сплачує Виконавець.`,
+      ``,
+      `Оплата цього інвойсу одночасно є свідченням надання послуг, їх прийняття в повному обсязі, а також підтвердженням кінцевих розрахунків між Сторонами.`,
+      ``,
+      `Сторони звільняються від відповідальності за невиконання чи неналежне виконання зобов'язань за договором на час дії форс-мажорних обставин.`,
+      ``,
+      `Оплата згідно цього інвойсу є підтвердженням того, що Сторони не мають взаємних претензій та не мають наміру заявляти рекламації.`,
+      ``,
+      `Усі спори, що виникнуть між Сторонами, будуть вирішуватись компетентним судом за місцезнаходженням відповідача.`,
+      ``,
+      `Призначення: Інвойс № ${invoiceNo}`,
+    ];
+  }
+
+  // ===========================
   // ===== UA PDF TEMPLATE =====
   // ===========================
   private async buildPdfBufferUa(invoice: any): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
-      const doc = new PDFDocument({ margin: 50 });
+      const doc = this.setupDoc();
 
       const chunks: Buffer[] = [];
-      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      const fontsRoot = path.join(process.cwd(), 'fonts', 'Inter');
-      const interVariablePath = path.join(
-        fontsRoot,
-        'Inter-VariableFont_opsz,wght.ttf',
+      const left = doc.page.margins.left;
+      const right = doc.page.margins.right;
+      const top = doc.page.margins.top;
+      const usableW = doc.page.width - left - right;
+
+      const org = invoice.organization ?? {};
+
+      // Header line like: "Invoice / Інвойс № ..."
+      doc.font('BodyBold').fontSize(12);
+      doc.text(`Інвойс № ${invoice.number}`, left, top, { align: 'left' });
+
+      doc.font('Body').fontSize(10);
+      doc.text(
+        `Дата інвойсу: ${this.formatDateISO(invoice.issueDate)}`,
+        left,
+        top,
+        {
+          align: 'right',
+          width: usableW,
+        },
       );
-      doc.registerFont('Body', interVariablePath);
-      doc.registerFont('BodyBold', interVariablePath);
 
-      doc
-        .font('BodyBold')
-        .fontSize(20)
-        .text(invoice.organization?.name || 'Invoice', { align: 'left' });
+      doc.moveDown(0.8);
 
-      doc.moveDown(0.5);
+      // Blocks layout (like on screenshot): 2 columns
+      const colGap = 10;
+      const colW = Math.floor((usableW - colGap) / 2);
 
-      doc.font('Body').fontSize(10);
-      if (invoice.organization?.industry)
-        doc.text(invoice.organization.industry);
+      const xL = left;
+      const xR = left + colW + colGap;
 
-      const orgLines: string[] = [];
-      if (invoice.organization?.country || invoice.organization?.city) {
-        orgLines.push(
-          [invoice.organization.country, invoice.organization.city]
-            .filter(Boolean)
-            .join(', '),
-        );
-      }
-      if (invoice.organization?.websiteUrl)
-        orgLines.push(invoice.organization.websiteUrl);
-      if (invoice.organization?.primaryContactEmail) {
-        orgLines.push(`Email: ${invoice.organization.primaryContactEmail}`);
-      }
-      if (invoice.organization?.primaryContactPhone) {
-        orgLines.push(`Тел: ${invoice.organization.primaryContactPhone}`);
-      }
-      orgLines.forEach((l) => doc.text(l));
+      let y = doc.y;
 
-      const issueDate = invoice.issueDate?.toISOString().slice(0, 10) ?? '-';
-      const dueDate = invoice.dueDate
-        ? invoice.dueDate.toISOString().slice(0, 10)
-        : '-';
+      // Row 1: Supplier (left) / Invoice meta (right)
+      const row1H = 86;
+      this.drawLabelValueBlock(
+        doc,
+        xL,
+        y,
+        colW,
+        row1H,
+        'Виконавець',
+        this.buildSupplierLines(org, 'UA'),
+        'UA',
+      );
 
-      doc
-        .font('Body')
-        .fontSize(12)
-        .text(`Інвойс № ${invoice.number}`, { align: 'right' })
-        .text(`Дата: ${issueDate}`, { align: 'right' })
-        .text(`Термін оплати: ${dueDate}`, { align: 'right' });
+      const metaLinesUA = [
+        `Номер: ${invoice.number ?? '—'}`,
+        `Дата: ${this.formatDateISO(invoice.issueDate)}`,
+        `Термін оплати: ${invoice.dueDate ? this.formatDateISO(invoice.dueDate) : '—'}`,
+        `Валюта: ${invoice.currency ?? '—'}`,
+      ];
+      this.drawLabelValueBlock(
+        doc,
+        xR,
+        y,
+        colW,
+        row1H,
+        'Дані інвойсу',
+        metaLinesUA,
+        'UA',
+      );
 
-      doc.moveDown(1.5);
+      y += row1H;
 
-      doc.font('BodyBold').fontSize(12).text('Клієнт', { underline: true });
-      doc.font('Body').fontSize(10);
+      // Row 2: Buyer full width
+      const row2H = 74;
+      this.drawLabelValueBlock(
+        doc,
+        left,
+        y,
+        usableW,
+        row2H,
+        'Замовник',
+        this.buildBuyerLines(invoice.client, 'UA'),
+        'UA',
+      );
+      y += row2H;
 
-      if (invoice.client) {
-        const c = invoice.client;
-        doc.text(c.name || '—');
-        if (c.contactName) doc.text(`Контактна особа: ${c.contactName}`);
-        if (c.email) doc.text(`Email: ${c.email}`);
-        if (c.phone) doc.text(`Телефон: ${c.phone}`);
-        if (c.taxNumber) doc.text(`Податковий номер: ${c.taxNumber}`);
-        if (c.address) doc.text(`Адреса: ${c.address}`);
-      } else {
-        doc.text('—');
-      }
+      // Row 3: Subject/Currency/Price/Terms (left) + Payment details (right)
+      const row3H = 108;
 
-      doc.moveDown(1.5);
+      const subject = this.buildSubject(invoice);
+      const totalStr = this.formatMoney(invoice.total);
+      const termsPay =
+        org?.paymentTermsTextUa?.trim?.() ||
+        (invoice?.paymentTermsUa?.trim?.() as string) ||
+        'Післяплата 100% після надання послуг.';
 
-      const tableTop = doc.y;
-      const colX = { name: 50, qty: 280, price: 330, tax: 400, total: 470 };
+      const leftInfoUA = [
+        `Предмет: ${subject}`,
+        `Валюта: ${invoice.currency ?? '—'}`,
+        `Ціна (загальна вартість): ${totalStr} ${invoice.currency ?? ''}`.trim(),
+        `Умови оплати: ${termsPay}`,
+      ];
 
-      doc.font('BodyBold').fontSize(10).text('Позиція', colX.name, tableTop);
-      doc.text('К-сть', colX.qty, tableTop);
-      doc.text('Ціна', colX.price, tableTop);
-      doc.text('ПДВ, %', colX.tax, tableTop);
-      doc.text('Сума', colX.total, tableTop);
+      this.drawLabelValueBlock(
+        doc,
+        xL,
+        y,
+        colW,
+        row3H,
+        'Інформація',
+        leftInfoUA,
+        'UA',
+      );
 
-      doc
-        .moveTo(50, tableTop + 14)
-        .lineTo(550, tableTop + 14)
-        .stroke();
+      this.drawLabelValueBlock(
+        doc,
+        xR,
+        y,
+        colW,
+        row3H,
+        'Реквізити для оплати',
+        this.buildPaymentLines(org, invoice, 'UA'),
+        'UA',
+      );
 
-      let y = tableTop + 20;
-      const rowHeight = 18;
-      const maxY = 750;
+      y += row3H + 10;
 
-      for (const item of invoice.items ?? []) {
-        if (y > maxY) {
-          doc.addPage();
-          y = 50;
+      // Items table
+      const tableX = left;
+      const tableW = usableW;
 
-          doc.font('BodyBold').fontSize(10).text('Позиція', colX.name, y);
-          doc.text('К-сть', colX.qty, y);
-          doc.text('Ціна', colX.price, y);
-          doc.text('ПДВ, %', colX.tax, y);
-          doc.text('Сума', colX.total, y);
+      const headerH = 22;
+      const rowH = 22;
 
-          doc
-            .moveTo(50, y + 14)
-            .lineTo(550, y + 14)
-            .stroke();
-          y += 20;
-        }
+      const cols = {
+        no: Math.floor(tableW * 0.06),
+        desc: Math.floor(tableW * 0.58),
+        qty: Math.floor(tableW * 0.12),
+        rate: Math.floor(tableW * 0.12),
+        amt:
+          tableW -
+          (Math.floor(tableW * 0.06) +
+            Math.floor(tableW * 0.58) +
+            Math.floor(tableW * 0.12) +
+            Math.floor(tableW * 0.12)),
+      };
 
-        const taxRateStr =
-          item.taxRate != null ? String(item.taxRate).replace('.', ',') : '-';
+      const colX = {
+        no: tableX,
+        desc: tableX + cols.no,
+        qty: tableX + cols.no + cols.desc,
+        rate: tableX + cols.no + cols.desc + cols.qty,
+        amt: tableX + cols.no + cols.desc + cols.qty + cols.rate,
+      };
 
+      const drawItemsHeader = (yy: number) => {
+        this.strokeRect(doc, tableX, yy, tableW, headerH);
         doc
-          .font('Body')
-          .fontSize(10)
-          .text(item.name ?? '—', colX.name, y, {
-            width: colX.qty - colX.name - 10,
-          });
+          .moveTo(colX.desc, yy)
+          .lineTo(colX.desc, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.qty, yy)
+          .lineTo(colX.qty, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.rate, yy)
+          .lineTo(colX.rate, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.amt, yy)
+          .lineTo(colX.amt, yy + headerH)
+          .stroke();
 
-        doc.text(String(item.quantity ?? 0), colX.qty, y);
-        doc.text(
-          `${this.formatMoney(item.unitPrice)} ${invoice.currency}`,
-          colX.price,
-          y,
-        );
-        doc.text(taxRateStr, colX.tax, y);
-        doc.text(
-          `${this.formatMoney(item.lineTotal)} ${invoice.currency}`,
-          colX.total,
-          y,
-        );
+        this.drawCell(doc, colX.no, yy, cols.no, headerH, '№', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.desc, yy, cols.desc, headerH, 'Опис', {
+          bold: true,
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Годин', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Тариф', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.amt, yy, cols.amt, headerH, 'Сума', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+      };
 
-        y += rowHeight;
+      const maxTableBottom = doc.page.height - doc.page.margins.bottom - 140;
 
-        if (item.description) {
-          doc
-            .font('Body')
-            .fontSize(9)
-            .fillColor('#6b7280')
-            .text(item.description, colX.name, y, {
-              width: colX.total - colX.name,
-            })
-            .fillColor('#000000');
+      let tableY = y;
+      drawItemsHeader(tableY);
+      tableY += headerH;
 
-          y += rowHeight;
+      const items = invoice.items ?? [];
+      let idx = 1;
+
+      for (const it of items) {
+        // if not enough space -> new page with header again
+        if (tableY + rowH > maxTableBottom) {
+          doc.addPage();
+          tableY = doc.page.margins.top;
+          drawItemsHeader(tableY);
+          tableY += headerH;
         }
+
+        // row outer box
+        this.strokeRect(doc, tableX, tableY, tableW, rowH);
+
+        // vertical separators
+        doc
+          .moveTo(colX.desc, tableY)
+          .lineTo(colX.desc, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.qty, tableY)
+          .lineTo(colX.qty, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.rate, tableY)
+          .lineTo(colX.rate, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.amt, tableY)
+          .lineTo(colX.amt, tableY + rowH)
+          .stroke();
+
+        const qty = it.quantity ?? 0;
+        const rate = this.formatMoney(it.unitPrice);
+        const amount = this.formatMoney(it.lineTotal);
+
+        // description (name + optional description)
+        const descText = [it.name, it.description].filter(Boolean).join('\n');
+
+        this.drawCell(doc, colX.no, tableY, cols.no, rowH, String(idx), {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(
+          doc,
+          colX.desc,
+          tableY,
+          cols.desc,
+          rowH,
+          descText || '—',
+          {
+            fontSize: 9.5,
+            padding: 6,
+            lineGap: 1.1,
+          },
+        );
+        this.drawCell(doc, colX.qty, tableY, cols.qty, rowH, String(qty), {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.rate, tableY, cols.rate, rowH, `${rate}`, {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.amt, tableY, cols.amt, rowH, `${amount}`, {
+          align: 'center',
+          valign: 'middle',
+        });
+
+        tableY += rowH;
+        idx += 1;
       }
+
+      // Totals row (like screenshot bottom)
+      const totalsH = 22;
+
+      // ensure space for totals block
+      if (
+        tableY + totalsH * 2 + 24 >
+        doc.page.height - doc.page.margins.bottom
+      ) {
+        doc.addPage();
+        tableY = doc.page.margins.top;
+      }
+
+      // Total line (right side)
+      const subtotalVal =
+        `${this.formatMoney(invoice.subtotal)} ${invoice.currency ?? ''}`.trim();
+      const vatVal =
+        `${this.formatMoney(invoice.taxAmount ?? 0)} ${invoice.currency ?? ''}`.trim();
+      const totalVal =
+        `${this.formatMoney(invoice.total)} ${invoice.currency ?? ''}`.trim();
+
+      const totals = [
+        { label: 'Сума без ПДВ:', value: subtotalVal, bold: false },
+        { label: 'ПДВ:', value: vatVal, bold: false },
+        { label: 'Усього до сплати:', value: totalVal, bold: true },
+      ];
+
+      for (const row of totals) {
+        this.strokeRect(doc, tableX, tableY, tableW, totalsH);
+        doc
+          .moveTo(colX.amt, tableY)
+          .lineTo(colX.amt, tableY + totalsH)
+          .stroke();
+
+        this.drawCell(
+          doc,
+          tableX,
+          tableY,
+          tableW - cols.amt,
+          totalsH,
+          row.label,
+          {
+            align: 'right',
+            valign: 'middle',
+            bold: row.bold,
+          },
+        );
+        this.drawCell(doc, colX.amt, tableY, cols.amt, totalsH, row.value, {
+          align: 'center',
+          valign: 'middle',
+          bold: row.bold,
+        });
+
+        tableY += totalsH;
+      }
+
+      doc.y = tableY + 18;
+
+      // Terms + signature on page 2 (or same if fits)
+      const termsLines = this.termsUA(String(invoice.number ?? ''));
+      const termsText = termsLines.join('\n');
+
+      this.ensureSpace(doc, 260);
+
+      // if still close to bottom -> new page for terms
+      const bottomY = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + 240 > bottomY) {
+        doc.addPage();
+        doc.y = doc.page.margins.top;
+      }
+
+      doc.font('Body').fontSize(9.5);
+      doc.text(termsText, left, doc.y, {
+        width: usableW,
+        lineGap: 1.2,
+      });
 
       doc.moveDown(2);
 
-      const subtotalStr = this.formatMoney(invoice.subtotal);
-      const taxAmountStr = this.formatMoney(invoice.taxAmount ?? 0);
-      const totalStr = this.formatMoney(invoice.total);
+      // Signature line
+      const signerName =
+        invoice?.createdBy?.fullName ||
+        invoice?.createdBy?.name ||
+        org?.signatoryName ||
+        '';
 
-      doc
-        .font('Body')
-        .fontSize(10)
-        .text(`Сума без ПДВ: ${subtotalStr} ${invoice.currency}`, {
-          align: 'right',
-        });
-      doc.text(`ПДВ: ${taxAmountStr} ${invoice.currency}`, { align: 'right' });
-      doc
-        .font('BodyBold')
-        .fontSize(12)
-        .text(`До оплати: ${totalStr} ${invoice.currency}`, { align: 'right' });
-
-      doc.moveDown(1.4);
-
-      if (invoice.notes) {
-        doc
-          .font('BodyBold')
-          .fontSize(10)
-          .text('Нотатки:', { underline: true })
-          .moveDown(0.5)
-          .font('Body')
-          .fontSize(9)
-          .text(invoice.notes);
-      }
-
-      // =========================
-      // ✅ Payment details (UA) — рівний блок справа
-      // =========================
-      doc.moveDown(1.2);
-
-      const org = invoice.organization ?? {};
-      const left = doc.page.margins.left;
-      const right = doc.page.margins.right;
-      const usableWidth = doc.page.width - left - right;
-
-      const colWidth = 300; // трохи вужче
-      const colXRight = left + usableWidth - colWidth + 18; // зсув вправо
-
-      this.ensureSpace(doc, 150);
-
-      const blockY = doc.y;
-
-      doc.font('BodyBold').fontSize(11);
-      doc.text('Реквізити для оплати', colXRight, blockY, {
-        width: colWidth,
-        align: 'left',
-        lineBreak: false,
-      });
-
-      const titleWidth = doc.widthOfString('Реквізити для оплати');
-      const underlineY = doc.y + 2;
-      doc
-        .moveTo(colXRight, underlineY)
-        .lineTo(colXRight + titleWidth, underlineY)
-        .stroke();
-
-      doc.y = underlineY + 10;
-
-      const receiver = org.beneficiaryName || org.legalName || org.name || '—';
-
-      const lines: string[] = [];
-      lines.push(`Отримувач: ${receiver}`);
-      if (org.iban) lines.push(`IBAN: ${this.formatIban(org.iban)}`);
-      if (org.bankName) lines.push(`Банк: ${org.bankName}`);
-      if (org.registrationNumber)
-        lines.push(`ЄДРПОУ: ${org.registrationNumber}`);
-      if (org.vatId) lines.push(`ІПН / VAT: ${org.vatId}`);
-      if (org.legalAddress) lines.push(`Юр. адреса: ${org.legalAddress}`);
-      lines.push(
-        `Призначення: ${org.paymentReferenceHint?.trim() || 'Оплата'}`,
-      );
+      const signLabel = 'Виконавець:';
+      const signY = doc.y + 10;
 
       doc.font('Body').fontSize(10);
-      doc.text(lines.join('\n'), colXRight, doc.y, {
-        width: colWidth,
-        align: 'left',
-      });
+      doc.text(signLabel, left, signY);
+
+      // line
+      const lineX1 = left + 78;
+      const lineX2 = left + 250;
+      doc
+        .moveTo(lineX1, signY + 12)
+        .lineTo(lineX2, signY + 12)
+        .stroke();
+
+      // name at right
+      doc.text(
+        signerName ? `(${signerName})` : '',
+        left + usableW - 220,
+        signY,
+        { width: 220, align: 'right' },
+      );
 
       doc.end();
     });
@@ -295,258 +697,383 @@ export class InvoicePdfService {
   // ===================================
   private async buildPdfBufferInternational(invoice: any): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
-      const doc = new PDFDocument({ margin: 50 });
+      const doc = this.setupDoc();
 
       const chunks: Buffer[] = [];
-      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      const fontsRoot = path.join(process.cwd(), 'fonts', 'Inter');
-      const interVariablePath = path.join(
-        fontsRoot,
-        'Inter-VariableFont_opsz,wght.ttf',
-      );
-      doc.registerFont('Body', interVariablePath);
-      doc.registerFont('BodyBold', interVariablePath);
+      const left = doc.page.margins.left;
+      const right = doc.page.margins.right;
+      const top = doc.page.margins.top;
+      const usableW = doc.page.width - left - right;
 
       const org = invoice.organization ?? {};
 
-      const left = doc.page.margins.left;
-      const right = doc.page.margins.right;
-      const usableWidth = doc.page.width - left - right;
+      // Header line like screenshot
+      doc.font('BodyBold').fontSize(12);
+      doc.text(`Invoice No ${invoice.number}`, left, top, { align: 'left' });
 
-      doc.font('BodyBold').fontSize(28).text('INVOICE', { align: 'left' });
+      doc.font('Body').fontSize(10);
+      doc.text(
+        `Date of invoice: ${this.formatDateISO(invoice.issueDate)}`,
+        left,
+        top,
+        {
+          align: 'right',
+          width: usableW,
+        },
+      );
+
       doc.moveDown(0.8);
 
-      const sellerX = left;
-      const sellerY = doc.y;
+      // 2-column blocks
+      const colGap = 10;
+      const colW = Math.floor((usableW - colGap) / 2);
 
-      doc
-        .font('BodyBold')
-        .fontSize(11)
-        .text('Seller', sellerX, sellerY, { underline: true });
-      doc.moveDown(0.3);
-      doc.font('Body').fontSize(11);
+      const xL = left;
+      const xR = left + colW + colGap;
 
-      const sellerLines: string[] = [];
-      sellerLines.push(org.name || '—');
-      if (org.city || org.country) {
-        sellerLines.push([org.city, org.country].filter(Boolean).join(', '));
-      }
-      if (org.websiteUrl) sellerLines.push(org.websiteUrl);
-      if (org.primaryContactEmail)
-        sellerLines.push(`Email: ${org.primaryContactEmail}`);
-      sellerLines.forEach((l) => doc.text(l, sellerX));
+      let y = doc.y;
 
-      const sellerEndY = doc.y;
+      const row1H = 86;
 
-      const issueDate = invoice.issueDate
-        ? invoice.issueDate.toISOString().slice(0, 10)
-        : '-';
-      const dueDate = invoice.dueDate
-        ? invoice.dueDate.toISOString().slice(0, 10)
-        : '-';
+      this.drawLabelValueBlock(
+        doc,
+        xL,
+        y,
+        colW,
+        row1H,
+        'Supplier',
+        this.buildSupplierLines(org, 'EN'),
+        'EN',
+      );
 
-      const rightText = [
-        `Invoice No: ${invoice.number}`,
-        `Issue Date: ${issueDate}`,
-        `Due Date: ${dueDate}`,
+      const metaLinesEN = [
+        `Invoice No: ${invoice.number ?? '—'}`,
+        `Issue Date: ${this.formatDateISO(invoice.issueDate)}`,
+        `Due Date: ${invoice.dueDate ? this.formatDateISO(invoice.dueDate) : '—'}`,
         `Currency: ${invoice.currency ?? '—'}`,
-      ].join('\n');
+      ];
+      this.drawLabelValueBlock(
+        doc,
+        xR,
+        y,
+        colW,
+        row1H,
+        'Invoice details',
+        metaLinesEN,
+        'EN',
+      );
 
-      doc.font('Body').fontSize(12);
-      doc.text(rightText, left, sellerY + 2, {
-        width: usableWidth,
-        align: 'right',
-      });
+      y += row1H;
 
-      const rightEndY =
-        sellerY +
-        2 +
-        doc.heightOfString(rightText, { width: usableWidth, align: 'right' });
+      const row2H = 74;
+      this.drawLabelValueBlock(
+        doc,
+        left,
+        y,
+        usableW,
+        row2H,
+        'Customer',
+        this.buildBuyerLines(invoice.client, 'EN'),
+        'EN',
+      );
 
-      doc.x = left;
-      doc.y = Math.max(sellerEndY, rightEndY) + 18;
+      y += row2H;
 
-      doc.font('BodyBold').fontSize(11).text('Buyer', { underline: true });
-      doc.moveDown(0.3);
-      doc.font('Body').fontSize(11);
-
-      if (invoice.client) {
-        const c = invoice.client;
-        const buyerLines: string[] = [];
-        buyerLines.push(c.name || '—');
-        if (c.contactName) buyerLines.push(c.contactName);
-        if (c.address) buyerLines.push(c.address);
-        if (c.email) buyerLines.push(c.email);
-        if (c.phone) buyerLines.push(c.phone);
-        if (c.taxNumber) buyerLines.push(`Tax ID: ${c.taxNumber}`);
-        doc.text(buyerLines.join('\n'), left, doc.y, {
-          width: usableWidth * 0.6,
-        });
-      } else {
-        doc.text('—');
-      }
-
-      doc.moveDown(1.2);
-
-      const tableTop = doc.y + 10;
-      const col = {
-        desc: left,
-        qty: left + Math.round(usableWidth * 0.6),
-        unit: left + Math.round(usableWidth * 0.72),
-        tax: left + Math.round(usableWidth * 0.84),
-        amt: left + Math.round(usableWidth * 0.93),
-      };
-
-      doc.font('BodyBold').fontSize(11);
-      doc.text('Description', col.desc, tableTop);
-      doc.text('Qty', col.qty, tableTop, { width: 40 });
-      doc.text('Unit', col.unit, tableTop, { width: 80 });
-      doc.text('Tax %', col.tax, tableTop, { width: 60 });
-      doc.text('Amount', col.amt, tableTop, { width: 80 });
-
-      doc
-        .moveTo(left, tableTop + 18)
-        .lineTo(left + usableWidth, tableTop + 18)
-        .stroke();
-
-      let y = tableTop + 26;
-      const rowHeight = 18;
-      const maxY = doc.page.height - doc.page.margins.bottom - 230;
-
-      doc.font('Body').fontSize(11);
-
-      for (const item of invoice.items ?? []) {
-        if (y > maxY) {
-          doc.addPage();
-          doc.x = left;
-          y = doc.page.margins.top;
-
-          doc.font('BodyBold').fontSize(11);
-          doc.text('Description', col.desc, y);
-          doc.text('Qty', col.qty, y, { width: 40 });
-          doc.text('Unit', col.unit, y, { width: 80 });
-          doc.text('Tax %', col.tax, y, { width: 60 });
-          doc.text('Amount', col.amt, y, { width: 80 });
-
-          doc
-            .moveTo(left, y + 18)
-            .lineTo(left + usableWidth, y + 18)
-            .stroke();
-
-          y += 26;
-          doc.font('Body').fontSize(11);
-        }
-
-        const taxRateStr =
-          item.taxRate != null ? String(item.taxRate).replace('.', ',') : '-';
-
-        doc.text(item.name ?? '—', col.desc, y, {
-          width: col.qty - col.desc - 10,
-        });
-        doc.text(String(item.quantity ?? 0), col.qty, y, { width: 40 });
-        doc.text(this.formatMoney(item.unitPrice), col.unit, y, { width: 80 });
-        doc.text(taxRateStr, col.tax, y, { width: 60 });
-        doc.text(this.formatMoney(item.lineTotal), col.amt, y, { width: 80 });
-
-        y += rowHeight;
-
-        if (item.description) {
-          doc
-            .font('Body')
-            .fontSize(9)
-            .fillColor('#6b7280')
-            .text(item.description, col.desc, y, { width: usableWidth })
-            .fillColor('#000000');
-          doc.font('Body').fontSize(11);
-          y += rowHeight;
-        }
-      }
-
-      doc.moveDown(1.2);
-
-      const subtotalStr = this.formatMoney(invoice.subtotal);
-      const taxAmountStr = this.formatMoney(invoice.taxAmount ?? 0);
+      const row3H = 108;
+      const subject = this.buildSubject(invoice);
       const totalStr = this.formatMoney(invoice.total);
 
-      const totalsX = left + usableWidth * 0.7;
+      const termsPay =
+        org?.paymentTermsTextEn?.trim?.() ||
+        (invoice?.paymentTermsEn?.trim?.() as string) ||
+        'Post payment of 100% upon the services delivery.';
 
-      doc
-        .font('Body')
-        .fontSize(11)
-        .text('Subtotal:', totalsX, doc.y, {
-          align: 'right',
-          width: usableWidth * 0.28,
+      const leftInfoEN = [
+        `Subject matter: ${subject}`,
+        `Currency: ${invoice.currency ?? '—'}`,
+        `Price (amount) of the services: ${totalStr} ${invoice.currency ?? ''}`.trim(),
+        `Terms of payment: ${termsPay}`,
+      ];
+
+      this.drawLabelValueBlock(
+        doc,
+        xL,
+        y,
+        colW,
+        row3H,
+        'Information',
+        leftInfoEN,
+        'EN',
+      );
+
+      this.drawLabelValueBlock(
+        doc,
+        xR,
+        y,
+        colW,
+        row3H,
+        'Payment details',
+        this.buildPaymentLines(org, invoice, 'EN'),
+        'EN',
+      );
+
+      y += row3H + 10;
+
+      // Items table: №, Description, Hours(Qty), Rate, Amount
+      const tableX = left;
+      const tableW = usableW;
+
+      const headerH = 22;
+      const rowH = 22;
+
+      const cols = {
+        no: Math.floor(tableW * 0.06),
+        desc: Math.floor(tableW * 0.58),
+        qty: Math.floor(tableW * 0.12),
+        rate: Math.floor(tableW * 0.12),
+        amt:
+          tableW -
+          (Math.floor(tableW * 0.06) +
+            Math.floor(tableW * 0.58) +
+            Math.floor(tableW * 0.12) +
+            Math.floor(tableW * 0.12)),
+      };
+
+      const colX = {
+        no: tableX,
+        desc: tableX + cols.no,
+        qty: tableX + cols.no + cols.desc,
+        rate: tableX + cols.no + cols.desc + cols.qty,
+        amt: tableX + cols.no + cols.desc + cols.qty + cols.rate,
+      };
+
+      const drawItemsHeader = (yy: number) => {
+        this.strokeRect(doc, tableX, yy, tableW, headerH);
+        doc
+          .moveTo(colX.desc, yy)
+          .lineTo(colX.desc, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.qty, yy)
+          .lineTo(colX.qty, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.rate, yy)
+          .lineTo(colX.rate, yy + headerH)
+          .stroke();
+        doc
+          .moveTo(colX.amt, yy)
+          .lineTo(colX.amt, yy + headerH)
+          .stroke();
+
+        this.drawCell(doc, colX.no, yy, cols.no, headerH, 'No', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
         });
-      doc.text(`${subtotalStr} ${invoice.currency}`, { align: 'right' });
-
-      doc.moveDown(0.3);
-      doc.text('Tax:', totalsX, doc.y, {
-        align: 'right',
-        width: usableWidth * 0.28,
-      });
-      doc.text(`${taxAmountStr} ${invoice.currency}`, { align: 'right' });
-
-      doc.moveDown(0.3);
-      doc
-        .font('BodyBold')
-        .fontSize(14)
-        .text('Total:', totalsX, doc.y, {
-          align: 'right',
-          width: usableWidth * 0.28,
+        this.drawCell(doc, colX.desc, yy, cols.desc, headerH, 'Description', {
+          bold: true,
+          valign: 'middle',
         });
-      doc.text(`${totalStr} ${invoice.currency}`, { align: 'right' });
+        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Hours', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Rate', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.amt, yy, cols.amt, headerH, 'Amount', {
+          bold: true,
+          align: 'center',
+          valign: 'middle',
+        });
+      };
 
-      doc.moveDown(1.6);
+      const maxTableBottom = doc.page.height - doc.page.margins.bottom - 140;
 
-      const leftColumn = [
-        `Beneficiary: ${org.beneficiaryName || org.legalName || org.name || '—'}`,
-        org.iban ? `IBAN: ${this.formatIban(org.iban)}` : null,
-        org.swiftBic ? `SWIFT/BIC: ${org.swiftBic}` : null,
-        org.bankName ? `Bank: ${org.bankName}` : null,
-        org.bankAddress ? `Bank address: ${org.bankAddress}` : null,
-      ].filter(Boolean) as string[];
+      let tableY = y;
+      drawItemsHeader(tableY);
+      tableY += headerH;
 
-      const rightColumn = [
-        org.vatId ? `VAT/Tax ID: ${org.vatId}` : null,
-        org.registrationNumber ? `Reg. No: ${org.registrationNumber}` : null,
-        org.legalAddress ? `Legal address: ${org.legalAddress}` : null,
-        `Reference: ${
-          org.paymentReferenceHint ||
-          'Please use the invoice number as payment reference.'
-        }`,
-      ].filter(Boolean) as string[];
+      const items = invoice.items ?? [];
+      let idx = 1;
 
-      const startY = doc.y;
+      for (const it of items) {
+        if (tableY + rowH > maxTableBottom) {
+          doc.addPage();
+          tableY = doc.page.margins.top;
+          drawItemsHeader(tableY);
+          tableY += headerH;
+        }
 
-      // ширина блоку реквізитів
-      const colWidth = 260;
+        this.strokeRect(doc, tableX, tableY, tableW, rowH);
+        doc
+          .moveTo(colX.desc, tableY)
+          .lineTo(colX.desc, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.qty, tableY)
+          .lineTo(colX.qty, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.rate, tableY)
+          .lineTo(colX.rate, tableY + rowH)
+          .stroke();
+        doc
+          .moveTo(colX.amt, tableY)
+          .lineTo(colX.amt, tableY + rowH)
+          .stroke();
 
-      // X позиція правого блоку — зсунута ближче до правого краю
-      const colXRight = left + usableWidth - colWidth + 18;
+        const qty = it.quantity ?? 0;
+        const rate = this.formatMoney(it.unitPrice);
+        const amount = this.formatMoney(it.lineTotal);
 
-      // заголовок тепер теж вирівняний під блок
-      doc
-        .font('BodyBold')
-        .fontSize(11)
-        .text('Payment details', colXRight, startY - 16, { underline: true });
+        const descText = [it.name, it.description].filter(Boolean).join('\n');
 
-      // сам блок реквізитів одним стовпчиком
-      doc.font('Body').fontSize(9);
-      doc.text([...leftColumn, ...rightColumn].join('\n'), colXRight, startY, {
-        width: colWidth,
+        this.drawCell(doc, colX.no, tableY, cols.no, rowH, String(idx), {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(
+          doc,
+          colX.desc,
+          tableY,
+          cols.desc,
+          rowH,
+          descText || '—',
+          {
+            fontSize: 9.5,
+            padding: 6,
+            lineGap: 1.1,
+          },
+        );
+        this.drawCell(doc, colX.qty, tableY, cols.qty, rowH, String(qty), {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.rate, tableY, cols.rate, rowH, `${rate}`, {
+          align: 'center',
+          valign: 'middle',
+        });
+        this.drawCell(doc, colX.amt, tableY, cols.amt, rowH, `${amount}`, {
+          align: 'center',
+          valign: 'middle',
+        });
+
+        tableY += rowH;
+        idx += 1;
+      }
+
+      // Totals rows like screenshot
+      const totalsH = 22;
+
+      if (
+        tableY + totalsH * 2 + 24 >
+        doc.page.height - doc.page.margins.bottom
+      ) {
+        doc.addPage();
+        tableY = doc.page.margins.top;
+      }
+
+      const subtotalVal =
+        `${this.formatMoney(invoice.subtotal)} ${invoice.currency ?? ''}`.trim();
+      const vatVal =
+        `${this.formatMoney(invoice.taxAmount ?? 0)} ${invoice.currency ?? ''}`.trim();
+      const totalVal =
+        `${this.formatMoney(invoice.total)} ${invoice.currency ?? ''}`.trim();
+
+      const totals = [
+        { label: 'Subtotal:', value: subtotalVal, bold: false },
+        { label: 'VAT/Tax:', value: vatVal, bold: false },
+        { label: 'Total to pay:', value: totalVal, bold: true },
+      ];
+
+      for (const row of totals) {
+        this.strokeRect(doc, tableX, tableY, tableW, totalsH);
+        doc
+          .moveTo(colX.amt, tableY)
+          .lineTo(colX.amt, tableY + totalsH)
+          .stroke();
+
+        this.drawCell(
+          doc,
+          tableX,
+          tableY,
+          tableW - cols.amt,
+          totalsH,
+          row.label,
+          {
+            align: 'right',
+            valign: 'middle',
+            bold: row.bold,
+          },
+        );
+        this.drawCell(doc, colX.amt, tableY, cols.amt, totalsH, row.value, {
+          align: 'center',
+          valign: 'middle',
+          bold: row.bold,
+        });
+
+        tableY += totalsH;
+      }
+
+      doc.y = tableY + 18;
+
+      // Terms + signature
+      const termsLines = this.termsEN(String(invoice.number ?? ''));
+      const termsText = termsLines.join('\n');
+
+      this.ensureSpace(doc, 260);
+
+      const bottomY = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + 240 > bottomY) {
+        doc.addPage();
+        doc.y = doc.page.margins.top;
+      }
+
+      doc.font('Body').fontSize(9.5);
+      doc.text(termsText, left, doc.y, {
+        width: usableW,
+        lineGap: 1.15,
       });
 
-      doc.moveDown(6);
+      doc.moveDown(2);
 
-      doc.font('BodyBold').fontSize(11).text('Notes', { underline: true });
-      doc.moveDown(0.3);
+      const signerName =
+        invoice?.createdBy?.fullName ||
+        invoice?.createdBy?.name ||
+        org?.signatoryName ||
+        '';
+
+      const signLabel = 'Supplier:';
+      const signY = doc.y + 10;
+
+      doc.font('Body').fontSize(10);
+      doc.text(signLabel, left, signY);
+
+      const lineX1 = left + 60;
+      const lineX2 = left + 240;
       doc
-        .font('Body')
-        .fontSize(10)
-        .text(invoice.notes?.trim() || '—', { width: usableWidth });
+        .moveTo(lineX1, signY + 12)
+        .lineTo(lineX2, signY + 12)
+        .stroke();
+
+      doc.text(
+        signerName ? `(${signerName})` : '',
+        left + usableW - 220,
+        signY,
+        {
+          width: 220,
+          align: 'right',
+        },
+      );
 
       doc.end();
     });
@@ -682,6 +1209,7 @@ export class InvoicePdfService {
         kind === 'UA'
           ? updated?.pdfDocument
           : updated?.pdfInternationalDocument;
+
       if (!document)
         throw new NotFoundException('PDF-документ для інвойсу не знайдено');
 
@@ -697,6 +1225,7 @@ export class InvoicePdfService {
 
     const document =
       kind === 'UA' ? invoice.pdfDocument : invoice.pdfInternationalDocument;
+
     if (!document)
       throw new NotFoundException('PDF-документ для інвойсу не знайдено');
 
