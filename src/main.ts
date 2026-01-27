@@ -11,6 +11,7 @@ async function bootstrap() {
     'http://localhost:3000',
     'https://pda-fe-dev-3883128e3ffd.herokuapp.com',
     'https://dev.spravly.com',
+    'https://spravly.com',
   ];
 
   app.enableCors({
