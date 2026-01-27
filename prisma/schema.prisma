@@ -120,7 +120,6 @@ model User {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  // ✅ 1:1 subscription (може бути null поки не створили)
   subscription Subscription?
 
   organizations     UserOrganization[]
@@ -138,6 +137,7 @@ model User {
   quotes               Quote[]
   invoiceRemindersSent InvoiceReminderLog[] @relation("InvoiceReminderToUser")
   activityLogs         ActivityLog[]
+  services UserService[]
 }
 
 // ---- Organization ----
@@ -236,28 +236,32 @@ model BusinessProfile {
   organization Organization @relation(fields: [organizationId], references: [id])
 }
 
-// ---- SubscriptionPlan / Subscription ----
-
 model Subscription {
   id String @id @default(cuid())
 
   userId String @unique
   user   User   @relation(fields: [userId], references: [id])
 
-  planId PlanId @default(FREE) // ✅ дефолт FREE
+  planId PlanId @default(FREE)
 
+  status            String   @default("active") // твій внутрішній статус
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean @default(false)
+
+  // ===== monobank =====
+  monoSubscriptionId String? @unique
+  monoStatus         String?
+  planIdPending      PlanId?
+
+  // (старі stripe поля можеш потім видалити)
   stripeCustomerId     String?
   stripeSubscriptionId String?
-  status               String    @default("active")
-  trialStart           DateTime?
-  trialEnd             DateTime?
-  currentPeriodStart   DateTime?
-  currentPeriodEnd     DateTime?
-  cancelAtPeriodEnd    Boolean   @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
 
 // ---- Documents ----
 
@@ -648,4 +652,23 @@ model ActivityLog {
   @@index([organizationId, createdAt])
   @@index([organizationId, entityType, createdAt])
   @@index([organizationId, entityType, entityId, createdAt])
+}
+
+model UserService {
+  id          String   @id @default(cuid())
+  userId      String
+
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(18, 2)
+
+  isActive    Boolean  @default(true)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, isActive])
+  @@index([userId, createdAt])
 }

@@ -13,15 +13,19 @@ export class EmailService {
 
   constructor() {
     const host = process.env.MAIL_HOST;
-    const port = Number(process.env.MAIL_PORT || 465);
-    const secure = String(process.env.MAIL_SECURE || 'true') === 'true';
+    const port = Number(process.env.MAIL_PORT || 587);
+
+    // Для SendGrid SMTP: 587 + secure=false (STARTTLS)
+    // Для 465: secure=true
+    const secure =
+      process.env.MAIL_SECURE != null
+        ? String(process.env.MAIL_SECURE) === 'true'
+        : port === 465;
+
     const user = process.env.MAIL_USER;
     const pass = process.env.MAIL_PASS;
 
     if (!host || !user || !pass) {
-      // не кидаю ексепшн, щоб app не падала при локальних тестах без ENV,
-      // але логічно — у проді краще кидати.
-
       console.warn(
         '[EmailService] Missing MAIL_HOST/MAIL_USER/MAIL_PASS env vars',
       );
@@ -32,6 +36,15 @@ export class EmailService {
       port,
       secure,
       auth: { user, pass },
+
+      // Щоб не ловити “self signed cert” в деяких інфрах
+      tls: {
+        rejectUnauthorized: true,
+      },
+
+      // Корисно для діагностики (можеш вимкнути потім)
+      logger: process.env.MAIL_LOGGER === 'true',
+      debug: process.env.MAIL_DEBUG === 'true',
     });
   }
 
