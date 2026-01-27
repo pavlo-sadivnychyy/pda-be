@@ -1,11 +1,11 @@
-name: Deploy Backend to Heroku (dev only)
+name: Deploy Backend to Heroku
 
 on:
   push:
-    branches: [ "dev" ]
+    branches: ["dev", "main"]
 
 concurrency:
-  group: heroku-deploy-dev
+  group: heroku-deploy-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       - name: Generate Prisma Client
         run: npx prisma generate
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL: ${{ github.ref_name == 'main' && secrets.DATABASE_URL_PROD || secrets.DATABASE_URL }}
 
       - name: Build
         run: npm run build --if-present
@@ -38,7 +38,7 @@ jobs:
       - name: Deploy to Heroku
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
+          HEROKU_APP_NAME: ${{ github.ref_name == 'main' && secrets.HEROKU_APP_NAME_PROD || secrets.HEROKU_APP_NAME }}
         run: |
-          echo "Deploying dev branch to Heroku: $HEROKU_APP_NAME"
+          echo "Deploying branch '${{ github.ref_name }}' to Heroku app: $HEROKU_APP_NAME"
           git push https://heroku:$HEROKU_API_KEY@git.heroku.com/$HEROKU_APP_NAME.git HEAD:main --force
