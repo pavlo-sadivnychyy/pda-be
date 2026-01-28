@@ -4,12 +4,11 @@ import {
   Get,
   Post,
   Req,
-  UseGuards,
-  BadRequestException,
   Headers,
   HttpCode,
+  UseGuards,
+  BadRequestException,
 } from '@nestjs/common';
-
 import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 
@@ -21,22 +20,18 @@ class CreateCheckoutDto {
   planId: PlanId;
 }
 
-class CancelSubscriptionDto {
-  effectiveFrom?: 'next_billing_period' | 'immediately';
-}
-
 @Controller('billing')
 export class BillingController {
   constructor(private readonly billing: BillingService) {}
 
   @Post('paddle/checkout')
   @UseGuards(ClerkAuthGuard)
-  async createPaddleCheckout(@Req() req: any, @Body() body: CreateCheckoutDto) {
-    if (!body.planId) throw new BadRequestException('planId is required');
+  async createCheckout(@Req() req: any, @Body() body: CreateCheckoutDto) {
+    if (!body.planId) throw new BadRequestException('planId required');
     if (body.planId === 'FREE')
-      throw new BadRequestException('FREE does not require checkout');
+      throw new BadRequestException('FREE plan has no checkout');
 
-    return this.billing.createPaddleCheckout({
+    return this.billing.createCheckout({
       authUserId: req.authUserId,
       planId: body.planId,
     });
@@ -48,27 +43,15 @@ export class BillingController {
     return this.billing.getMySubscription(req.authUserId);
   }
 
-  @Post('paddle/cancel')
-  @UseGuards(ClerkAuthGuard)
-  async cancelMySubscription(
-    @Req() req: any,
-    @Body() body: CancelSubscriptionDto,
-  ) {
-    return this.billing.cancelMySubscription({
-      authUserId: req.authUserId,
-      effectiveFrom: body.effectiveFrom ?? 'next_billing_period',
-    });
-  }
-
   @Post('paddle/webhook')
   @HttpCode(200)
-  async paddleWebhook(
+  async webhook(
     @Req() req: RawBodyRequest<Request>,
-    @Headers('paddle-signature') s1?: string,
-    @Headers('Paddle-Signature') s2?: string,
+    @Headers('paddle-signature') sig?: string,
+    @Headers('Paddle-Signature') sigAlt?: string,
   ) {
-    const sig = s1 ?? s2;
-    await this.billing.handlePaddleWebhook(req.rawBody, sig);
+    const signature = sig ?? sigAlt;
+    await this.billing.handlePaddleWebhook(req.rawBody, signature);
     return { ok: true };
   }
 }
