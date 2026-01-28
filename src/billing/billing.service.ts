@@ -30,15 +30,11 @@ export class BillingService {
         : 'https://sandbox-api.paddle.com';
 
     const apiKey = process.env.PADDLE_API_KEY;
-    if (!apiKey) {
-      // не кидаю error на старті щоб не валився app boot, але при запиті буде 500
-      // краще поставити env на Heroku
-    }
 
     this.paddle = axios.create({
       baseURL,
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey ?? ''}`,
         'Content-Type': 'application/json',
       },
       timeout: 20000,
@@ -51,6 +47,32 @@ export class BillingService {
     return null;
   }
 
+  private priceIdToPlan(priceId: string | null): PlanId | null {
+    if (!priceId) return null;
+    if (priceId === process.env.PADDLE_PRICE_BASIC_ID) return PlanId.BASIC;
+    if (priceId === process.env.PADDLE_PRICE_PRO_ID) return PlanId.PRO;
+    return null;
+  }
+
+  private requireEnv(name: string) {
+    const v = process.env[name];
+    if (!v) throw new InternalServerErrorException(`${name} is not set`);
+    return v;
+  }
+
+  private async fetchTransaction(transactionId: string) {
+    try {
+      const res = await this.paddle.get(`/transactions/${transactionId}`);
+      return res?.data?.data;
+    } catch (e: any) {
+      throw new InternalServerErrorException(
+        e?.response?.data?.message ??
+          e?.message ??
+          'Failed to fetch transaction',
+      );
+    }
+  }
+
   async createCheckout(input: CreateCheckoutInput) {
     const { authUserId, planId } = input;
 
@@ -60,10 +82,7 @@ export class BillingService {
       throw new BadRequestException('FREE does not require checkout');
     }
 
-    const apiKey = process.env.PADDLE_API_KEY;
-    if (!apiKey) {
-      throw new InternalServerErrorException('PADDLE_API_KEY is not set');
-    }
+    this.requireEnv('PADDLE_API_KEY');
 
     const priceId = this.getPriceId(planId);
     if (!priceId) {
@@ -72,56 +91,45 @@ export class BillingService {
       );
     }
 
+    const frontendUrl = this.requireEnv('APP_PUBLIC_URL'); // https://dev.spravly.com
+
     const user = await this.prisma.user.findUnique({
       where: { authUserId },
       include: { subscription: true },
     });
     if (!user) throw new NotFoundException('User not found');
 
-    // ✅ гарантовано є subscription
+    // ensure subscription row exists
     await this.prisma.subscription.upsert({
       where: { userId: user.id },
       create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
       update: {},
     });
 
-    const frontendUrl = process.env.APP_PUBLIC_URL; // https://dev.spravly.com
-    if (!frontendUrl) {
-      throw new InternalServerErrorException('FRONTEND_URL is not set');
-    }
-
-    // ✅ створюємо transaction у Paddle
-    // ⚠️ ВАЖЛИВО: ми НЕ віддаємо Paddle "checkout.url" на твій домен (це те, що колись давало domain not approved)
-    // Ми просто створюємо transaction і відкриваємо його через Paddle.js (transactionId).
     let transactionId: string;
 
     try {
       const res = await this.paddle.post('/transactions', {
         items: [{ price_id: priceId, quantity: 1 }],
-        customer: {
-          email: user.email,
-        },
+        customer: { email: user.email },
         custom_data: {
           userId: user.id,
           planId,
         },
         checkout: {
           settings: {
-            // Paddle overlay
             display_mode: 'wide-overlay',
-            // після success ми все одно робимо sync з фронта, але цей url потрібен як fallback
-            success_url: `${frontendUrl}/checkout?_ptxn={transaction_id}&result=success`,
+            // return page AFTER payment (front will sync + redirect to pricing)
+            success_url: `${frontendUrl}/checkout?transaction_id={transaction_id}&result=success`,
             cancel_url: `${frontendUrl}/pricing?checkout=cancel`,
           },
         },
       });
 
       transactionId = res?.data?.data?.id;
-      if (!transactionId) {
+      if (!transactionId)
         throw new Error('Paddle did not return transaction id');
-      }
     } catch (e: any) {
-      // ТУТ у тебе і був Invalid URL, бо axios не мав baseURL.
       throw new InternalServerErrorException(
         e?.response?.data?.error?.message ??
           e?.response?.data?.message ??
@@ -130,103 +138,134 @@ export class BillingService {
       );
     }
 
-    // ✅ ставимо pending у нашій БД (щоб UI показував "processing")
+    // mark pending locally (so UI can show "processing")
     await this.prisma.subscription.update({
       where: { userId: user.id },
       data: {
         status: 'pending',
-        planId, // бажаний план (реально активним стане після webhook / sync)
+        planId,
         paddleTransactionId: transactionId,
       },
     });
 
-    // ✅ redirect на нашу сторінку /checkout, яка відкриє Paddle overlay і зробить редірект назад
+    // IMPORTANT: no redirect url to your /checkout for “payment”
     return {
       transactionId,
-      checkoutUrl: `${frontendUrl}/checkout?_ptxn=${transactionId}`,
+      successUrl: `${frontendUrl}/checkout?transaction_id=${transactionId}&result=success`,
+      cancelUrl: `${frontendUrl}/pricing?checkout=cancel`,
     };
   }
 
-  // ✅ фронт викликає це після success, щоб примусово підсинхронити (навіть якщо webhook затупив)
   async syncTransactionToDb(input: SyncTxnInput) {
     const { authUserId, transactionId } = input;
+
     if (!authUserId) throw new BadRequestException('authUserId missing');
     if (!transactionId) throw new BadRequestException('transactionId missing');
 
-    const user = await this.prisma.user.findUnique({ where: { authUserId } });
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      include: { subscription: true },
+    });
     if (!user) throw new NotFoundException('User not found');
 
-    // беремо транзакцію з Paddle
-    let txn: any;
-    try {
-      const res = await this.paddle.get(`/transactions/${transactionId}`);
-      txn = res?.data?.data;
-    } catch (e: any) {
-      throw new InternalServerErrorException(
-        e?.response?.data?.message ??
-          e?.message ??
-          'Failed to fetch transaction',
-      );
-    }
-
-    // статуси Paddle бувають різні; нас цікавить paid/completed
+    const txn = await this.fetchTransaction(transactionId);
     const paddleStatus = String(txn?.status ?? '').toLowerCase();
 
-    // витягуємо price_id
     const priceId: string | null =
       txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
 
     const planId = this.priceIdToPlan(priceId);
-    if (!planId) {
-      // не валимо, але збережемо як є
-      await this.prisma.subscription.update({
-        where: { userId: user.id },
-        data: { paddleStatus, paddleTransactionId: transactionId },
-      });
-      return {
-        ok: true,
-        synced: false,
-        reason: 'Unknown price id',
-        paddleStatus,
-      };
-    }
 
     const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
 
-    if (isPaid) {
-      await this.prisma.subscription.update({
-        where: { userId: user.id },
-        data: {
-          planId,
-          status: 'active',
-          cancelAtPeriodEnd: false,
-          paddleStatus,
-          paddleTransactionId: transactionId,
-          // currentPeriodEnd краще брати з subscription events, але хоча б так:
-          currentPeriodStart: new Date(),
-        },
-      });
-      return { ok: true, synced: true, planId, paddleStatus };
-    }
-
-    // якщо ще не paid — лишаємо pending
+    // always store what we know
     await this.prisma.subscription.update({
       where: { userId: user.id },
       data: {
-        planId,
-        status: 'pending',
         paddleStatus,
         paddleTransactionId: transactionId,
+        ...(planId ? { planId } : {}),
+        ...(isPaid ? { status: 'active', cancelAtPeriodEnd: false } : {}),
       },
     });
 
-    return { ok: true, synced: false, planId, paddleStatus };
+    const updated = await this.prisma.user.findUnique({
+      where: { id: user.id },
+      include: { subscription: true },
+    });
+
+    return { ok: true, user: updated };
   }
 
-  private priceIdToPlan(priceId: string | null): PlanId | null {
-    if (!priceId) return null;
-    if (priceId === process.env.PADDLE_PRICE_BASIC_ID) return PlanId.BASIC;
-    if (priceId === process.env.PADDLE_PRICE_PRO_ID) return PlanId.PRO;
-    return null;
+  // webhook handler (robust)
+  async handleWebhook(body: any, _headers: any) {
+    const eventType = body?.event_type ?? body?.eventType ?? body?.type ?? null;
+    const data = body?.data ?? body;
+
+    const transactionId: string | null =
+      data?.transaction_id ?? data?.id ?? data?.transaction?.id ?? null;
+
+    // If it’s a transaction event, it usually includes transaction id.
+    // If not — we just ACK to avoid retries storm.
+    if (!transactionId) {
+      return { ok: true, ignored: true, reason: 'No transactionId', eventType };
+    }
+
+    // find subscription by transactionId first
+    const sub = await this.prisma.subscription.findFirst({
+      where: { paddleTransactionId: transactionId },
+    });
+
+    // If not found — try resolve via transaction custom_data.userId
+    let userId: string | null = sub?.userId ?? null;
+
+    if (!userId) {
+      const txn = await this.fetchTransaction(transactionId);
+      userId = txn?.custom_data?.userId ?? txn?.custom_data?.user_id ?? null;
+
+      if (!userId) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: 'No matching subscription / no custom_data.userId',
+          eventType,
+        };
+      }
+    }
+
+    const txn = await this.fetchTransaction(transactionId);
+
+    const paddleStatus = String(txn?.status ?? '').toLowerCase();
+    const priceId: string | null =
+      txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
+    const planId = this.priceIdToPlan(priceId);
+
+    const shouldActivate =
+      eventType === 'transaction.paid' ||
+      eventType === 'transaction.completed' ||
+      paddleStatus === 'paid' ||
+      paddleStatus === 'completed';
+
+    await this.prisma.subscription.upsert({
+      where: { userId },
+      create: {
+        userId,
+        planId: planId ?? PlanId.FREE,
+        status: shouldActivate ? 'active' : 'pending',
+        paddleStatus,
+        paddleTransactionId: transactionId,
+        cancelAtPeriodEnd: false,
+      },
+      update: {
+        paddleStatus,
+        paddleTransactionId: transactionId,
+        ...(planId ? { planId } : {}),
+        ...(shouldActivate
+          ? { status: 'active', cancelAtPeriodEnd: false }
+          : {}),
+      },
+    });
+
+    return { ok: true };
   }
 }

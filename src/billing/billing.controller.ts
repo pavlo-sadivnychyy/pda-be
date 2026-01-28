@@ -1,4 +1,11 @@
-import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Headers,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { BillingService } from './billing.service';
 import { PlanId } from '@prisma/client';
@@ -20,7 +27,7 @@ export class BillingController {
     });
   }
 
-  // optional: endpoint to "sync" after success (front calls it on /checkout page)
+  // front calls it after success (return page or direct after overlay success)
   @Post('sync-transaction')
   @UseGuards(ClerkAuthGuard)
   async syncTransaction(
@@ -31,5 +38,12 @@ export class BillingController {
       authUserId: req.authUserId,
       transactionId: body.transactionId,
     });
+  }
+
+  // Paddle webhook
+  @Post('webhook')
+  async webhook(@Body() body: any, @Headers() headers: any) {
+    // signature verify can be added later; first make it work reliably
+    return this.billing.handleWebhook(body, headers);
   }
 }
