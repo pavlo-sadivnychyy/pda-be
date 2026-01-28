@@ -3,7 +3,7 @@ import { AppModule } from './app.module';
 import * as process from 'node:process';
 
 async function bootstrap() {
-  // ✅ IMPORTANT: enables req.rawBody for webhook signature verification
+  // ✅ required for webhook signature verification (raw body)
   const app = await NestFactory.create(AppModule, { rawBody: true });
 
   const allowedOrigins = [
@@ -25,7 +25,6 @@ async function bootstrap() {
     allowedHeaders: [
       'Content-Type',
       'Authorization',
-      // Paddle webhook signature header
       'Paddle-Signature',
       'paddle-signature',
     ],

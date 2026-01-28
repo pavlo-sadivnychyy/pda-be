@@ -64,10 +64,10 @@ export class BillingController {
   @HttpCode(200)
   async paddleWebhook(
     @Req() req: RawBodyRequest<Request>,
-    @Headers('paddle-signature') paddleSignature?: string,
-    @Headers('Paddle-Signature') paddleSignatureAlt?: string,
+    @Headers('paddle-signature') s1?: string,
+    @Headers('Paddle-Signature') s2?: string,
   ) {
-    const sig = paddleSignature ?? paddleSignatureAlt;
+    const sig = s1 ?? s2;
     await this.billing.handlePaddleWebhook(req.rawBody, sig);
     return { ok: true };
   }

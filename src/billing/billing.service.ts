@@ -16,16 +16,12 @@ type CancelMySubscriptionInput = {
 
 function mustEnv(name: string): string {
   const v = process.env[name];
-  if (!v || !v.trim()) {
-    // hard fail (crash early) is better than random 500 on click
-    throw new Error(`Missing env: ${name}`);
-  }
+  if (!v || !v.trim()) throw new Error(`Missing env: ${name}`);
   return v.trim();
 }
 
 function normalizeBaseUrl(url: string): string {
   const u = url.trim();
-  if (!u) return u;
   return u.endsWith('/') ? u.slice(0, -1) : u;
 }
 
@@ -34,7 +30,6 @@ export class BillingService {
   private readonly logger = new Logger(BillingService.name);
 
   constructor(private readonly prisma: PrismaService) {
-    // ✅ Fail fast if critical env is missing
     mustEnv('PADDLE_ENV');
     mustEnv('PADDLE_API_KEY');
     mustEnv('PADDLE_WEBHOOK_SECRET');
@@ -72,16 +67,20 @@ export class BillingService {
     const priceId = this.planToPriceId(input.planId);
 
     const appUrl = normalizeBaseUrl(mustEnv('APP_PUBLIC_URL'));
-    const successUrl = `${appUrl}/pricing`;
-    const cancelUrl = `${appUrl}/pricing`;
+
+    // ✅ IMPORTANT: your app page that includes Paddle.js and opens checkout via _ptxn
+    // Default payment link must be configured in Paddle dashboard to the same page. :contentReference[oaicite:11]{index=11}
+    const checkoutPage = `${appUrl}/checkout`;
 
     try {
+      // Create transaction (auto-collected) -> includes checkout.url :contentReference[oaicite:12]{index=12}
       const { data } = await this.paddle.post('/transactions', {
         items: [{ price_id: priceId, quantity: 1 }],
         customer: { email: user.email },
         checkout: {
-          success_url: successUrl,
-          cancel_url: cancelUrl,
+          // can be null to use default payment link,
+          // or set explicitly to your approved domain. :contentReference[oaicite:13]{index=13}
+          url: checkoutPage,
         },
         custom_data: {
           authUserId: input.authUserId,
@@ -101,6 +100,7 @@ export class BillingService {
         throw new BadRequestException('Failed to create Paddle checkout');
       }
 
+      // Local subscription state: pending until webhook confirms
       await this.prisma.subscription.upsert({
         where: { userId: user.id },
         create: {
@@ -121,13 +121,13 @@ export class BillingService {
 
       return { transactionId, checkoutUrl };
     } catch (e: any) {
-      const paddlePayload = e?.response?.data;
+      const payload = e?.response?.data ?? null;
       this.logger.error(
-        `Paddle create checkout failed: ${JSON.stringify(paddlePayload ?? e?.message ?? e)}`,
+        `Paddle create transaction failed: ${JSON.stringify(payload ?? e?.message ?? e)}`,
       );
       throw new BadRequestException(
-        paddlePayload?.error?.detail ??
-          paddlePayload?.message ??
+        payload?.error?.detail ??
+          payload?.message ??
           'Failed to create Paddle checkout',
       );
     }
@@ -154,68 +154,70 @@ export class BillingService {
 
     const secret = mustEnv('PADDLE_WEBHOOK_SECRET');
 
+    // verify webhook signature :contentReference[oaicite:14]{index=14}
     const ok = this.verifyPaddleSignature(rawBody, signature, secret);
-    if (!ok) {
-      this.logger.warn(`Invalid Paddle-Signature. Header=${signature}`);
-      throw new BadRequestException('Invalid Paddle-Signature');
-    }
+    if (!ok) throw new BadRequestException('Invalid Paddle-Signature');
 
-    let event: any;
-    try {
-      event = JSON.parse(rawBody.toString('utf8'));
-    } catch {
-      throw new BadRequestException('Invalid JSON payload');
-    }
-
+    const event = JSON.parse(rawBody.toString('utf8'));
     const eventType = event?.event_type;
     const data = event?.data;
 
     this.logger.log(`Paddle webhook: ${eventType}`);
 
-    // 1) subscription.created/activated often includes transaction_id
-    const paddleSubId = data?.id;
+    /**
+     * Мінімальний надійний флоу для “після оплати активувати план”:
+     * 1) дивимось події, де можна прив’язатись до transaction_id або subscription_id
+     * 2) оновлюємо локальну subscription по paddleTransactionId / paddleSubscriptionId
+     *
+     * Реальні event types дивись у Paddle Webhooks docs. :contentReference[oaicite:15]{index=15}
+     */
+
+    // Часто subscription.* має transaction_id
+    const subscriptionId = data?.id;
     const txIdFromSub = data?.transaction_id;
 
-    if (paddleSubId && txIdFromSub) {
-      const sub = await this.prisma.subscription.findFirst({
+    if (subscriptionId && txIdFromSub) {
+      const local = await this.prisma.subscription.findFirst({
         where: { paddleTransactionId: String(txIdFromSub) },
       });
+      if (!local) return;
 
-      if (sub) {
-        const status = String(data?.status ?? 'active');
-        const periodStart = data?.current_billing_period?.starts_at
-          ? new Date(data.current_billing_period.starts_at)
-          : null;
-        const periodEnd = data?.current_billing_period?.ends_at
-          ? new Date(data.current_billing_period.ends_at)
-          : null;
+      const status = String(data?.status ?? 'active');
 
-        await this.prisma.subscription.update({
-          where: { id: sub.id },
-          data: {
-            paddleSubscriptionId: String(paddleSubId),
-            paddleStatus: status,
-            status: /active|trialing/i.test(status) ? 'active' : 'pending',
-            currentPeriodStart: periodStart ?? sub.currentPeriodStart,
-            currentPeriodEnd: periodEnd ?? sub.currentPeriodEnd,
-          },
-        });
-      }
+      const periodStart = data?.current_billing_period?.starts_at
+        ? new Date(data.current_billing_period.starts_at)
+        : null;
+      const periodEnd = data?.current_billing_period?.ends_at
+        ? new Date(data.current_billing_period.ends_at)
+        : null;
+
+      await this.prisma.subscription.update({
+        where: { id: local.id },
+        data: {
+          paddleSubscriptionId: String(subscriptionId),
+          paddleStatus: status,
+          status: /active|trialing/i.test(status) ? 'active' : 'pending',
+          currentPeriodStart: periodStart ?? local.currentPeriodStart,
+          currentPeriodEnd: periodEnd ?? local.currentPeriodEnd,
+          // planId лишається той, що ти задав при checkout (через priceId mapping)
+        },
+      });
 
       return;
     }
 
-    // 2) subscription.updated/canceled/past_due — find by paddleSubscriptionId
-    const subId = data?.id;
-    if (subId) {
+    // subscription.updated/canceled/past_due — шукаємо по paddleSubscriptionId
+    if (subscriptionId) {
       const local = await this.prisma.subscription.findFirst({
-        where: { paddleSubscriptionId: String(subId) },
+        where: { paddleSubscriptionId: String(subscriptionId) },
       });
       if (!local) return;
 
       const status = String(data?.status ?? '');
-      const cancelAtPeriodEnd =
-        data?.scheduled_change?.action === 'cancel' ? true : false;
+
+      const cancelAtPeriodEnd = Boolean(
+        data?.scheduled_change?.action === 'cancel',
+      ); // Paddle uses scheduled_change for end-of-period cancel :contentReference[oaicite:16]{index=16}
 
       const periodStart = data?.current_billing_period?.starts_at
         ? new Date(data.current_billing_period.starts_at)
@@ -306,21 +308,20 @@ export class BillingService {
         currentPeriodEnd: periodEnd,
       };
     } catch (e: any) {
-      const paddlePayload = e?.response?.data;
+      const payload = e?.response?.data ?? null;
       this.logger.error(
-        `Paddle cancel failed: ${JSON.stringify(paddlePayload ?? e?.message ?? e)}`,
+        `Paddle cancel failed: ${JSON.stringify(payload ?? e?.message ?? e)}`,
       );
       throw new BadRequestException(
-        paddlePayload?.error?.detail ??
-          paddlePayload?.message ??
-          'Failed to cancel subscription',
+        payload?.error?.detail ?? payload?.message ?? 'Failed to cancel',
       );
     }
   }
 
   /**
-   * ✅ Real Paddle signature verification:
-   * Header example: "ts=1700000000;h1=abcdef..."
+   * Paddle webhook signature verification:
+   * Uses Paddle-Signature header. :contentReference[oaicite:17]{index=17}
+   * Header: "ts=...;h1=..."
    * Signature: HMAC_SHA256(secret, `${ts}:${rawBody}`)
    */
   private verifyPaddleSignature(
@@ -331,7 +332,6 @@ export class BillingService {
     const parts = header.split(';').map((p) => p.trim());
     const tsPart = parts.find((p) => p.startsWith('ts='));
     const h1Part = parts.find((p) => p.startsWith('h1='));
-
     if (!tsPart || !h1Part) return false;
 
     const ts = tsPart.slice(3);
