@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PlanId } from '@prisma/client';
 import axios from 'axios';
+import * as crypto from 'crypto';
 
 type CreateCheckoutInput = {
   authUserId: string;
@@ -13,11 +14,34 @@ type CancelMySubscriptionInput = {
   effectiveFrom: 'next_billing_period' | 'immediately';
 };
 
+function mustEnv(name: string): string {
+  const v = process.env[name];
+  if (!v || !v.trim()) {
+    // hard fail (crash early) is better than random 500 on click
+    throw new Error(`Missing env: ${name}`);
+  }
+  return v.trim();
+}
+
+function normalizeBaseUrl(url: string): string {
+  const u = url.trim();
+  if (!u) return u;
+  return u.endsWith('/') ? u.slice(0, -1) : u;
+}
+
 @Injectable()
 export class BillingService {
   private readonly logger = new Logger(BillingService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) {
+    // ✅ Fail fast if critical env is missing
+    mustEnv('PADDLE_ENV');
+    mustEnv('PADDLE_API_KEY');
+    mustEnv('PADDLE_WEBHOOK_SECRET');
+    mustEnv('APP_PUBLIC_URL');
+    mustEnv('PADDLE_PRICE_BASIC_ID');
+    mustEnv('PADDLE_PRICE_PRO_ID');
+  }
 
   private paddle = axios.create({
     baseURL:
@@ -32,8 +56,8 @@ export class BillingService {
   });
 
   private planToPriceId(planId: PlanId): string {
-    if (planId === 'BASIC') return process.env.PADDLE_PRICE_BASIC_ID!;
-    if (planId === 'PRO') return process.env.PADDLE_PRICE_PRO_ID!;
+    if (planId === 'BASIC') return mustEnv('PADDLE_PRICE_BASIC_ID');
+    if (planId === 'PRO') return mustEnv('PADDLE_PRICE_PRO_ID');
     throw new BadRequestException('Unsupported planId');
   }
 
@@ -47,54 +71,66 @@ export class BillingService {
 
     const priceId = this.planToPriceId(input.planId);
 
-    // Після оплати повертаємо на фронт (можеш зробити /pricing?success=1)
-    const successUrl = `${process.env.APP_PUBLIC_URL}/pricing`;
-    const cancelUrl = `${process.env.APP_PUBLIC_URL}/pricing`;
+    const appUrl = normalizeBaseUrl(mustEnv('APP_PUBLIC_URL'));
+    const successUrl = `${appUrl}/pricing`;
+    const cancelUrl = `${appUrl}/pricing`;
 
-    // Create Transaction (auto-collected) -> checkout.url
-    // Paddle автоматично створить subscription після completed. :contentReference[oaicite:5]{index=5}
-    const { data } = await this.paddle.post('/transactions', {
-      items: [{ price_id: priceId, quantity: 1 }],
-      customer: { email: user.email },
-      checkout: {
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-      },
-      custom_data: {
-        authUserId: input.authUserId,
-        userId: user.id,
-        planId: input.planId,
-      },
-    });
+    try {
+      const { data } = await this.paddle.post('/transactions', {
+        items: [{ price_id: priceId, quantity: 1 }],
+        customer: { email: user.email },
+        checkout: {
+          success_url: successUrl,
+          cancel_url: cancelUrl,
+        },
+        custom_data: {
+          authUserId: input.authUserId,
+          userId: user.id,
+          planId: input.planId,
+        },
+      });
 
-    const tx = data?.data;
-    const transactionId = tx?.id as string | undefined;
-    const checkoutUrl = tx?.checkout?.url as string | undefined;
+      const tx = data?.data;
+      const transactionId = tx?.id as string | undefined;
+      const checkoutUrl = tx?.checkout?.url as string | undefined;
 
-    if (!transactionId || !checkoutUrl) {
-      this.logger.error(`Unexpected Paddle response: ${JSON.stringify(data)}`);
-      throw new BadRequestException('Failed to create Paddle checkout');
+      if (!transactionId || !checkoutUrl) {
+        this.logger.error(
+          `Unexpected Paddle response: ${JSON.stringify(data)}`,
+        );
+        throw new BadRequestException('Failed to create Paddle checkout');
+      }
+
+      await this.prisma.subscription.upsert({
+        where: { userId: user.id },
+        create: {
+          userId: user.id,
+          planId: PlanId.FREE,
+          status: 'pending',
+          paddleTransactionId: transactionId,
+          paddlePriceId: priceId,
+          paddleStatus: 'transaction_created',
+        },
+        update: {
+          status: 'pending',
+          paddleTransactionId: transactionId,
+          paddlePriceId: priceId,
+          paddleStatus: 'transaction_created',
+        },
+      });
+
+      return { transactionId, checkoutUrl };
+    } catch (e: any) {
+      const paddlePayload = e?.response?.data;
+      this.logger.error(
+        `Paddle create checkout failed: ${JSON.stringify(paddlePayload ?? e?.message ?? e)}`,
+      );
+      throw new BadRequestException(
+        paddlePayload?.error?.detail ??
+          paddlePayload?.message ??
+          'Failed to create Paddle checkout',
+      );
     }
-
-    await this.prisma.subscription.upsert({
-      where: { userId: user.id },
-      create: {
-        userId: user.id,
-        planId: PlanId.FREE,
-        status: 'pending',
-        paddleTransactionId: transactionId,
-        paddlePriceId: priceId,
-        paddleStatus: 'transaction_created',
-      },
-      update: {
-        status: 'pending',
-        paddleTransactionId: transactionId,
-        paddlePriceId: priceId,
-        paddleStatus: 'transaction_created',
-      },
-    });
-
-    return { transactionId, checkoutUrl };
   }
 
   async getMySubscription(authUserId: string) {
@@ -112,29 +148,33 @@ export class BillingService {
 
     if (!rawBody || !Buffer.isBuffer(rawBody)) {
       throw new BadRequestException(
-        'Webhook rawBody is missing (check main.ts)',
+        'Webhook rawBody is missing (check main.ts rawBody:true)',
       );
     }
 
-    const secret = process.env.PADDLE_WEBHOOK_SECRET!;
-    const ok = this.verifyPaddleSignature(rawBody, signature, secret);
-    if (!ok) throw new BadRequestException('Invalid Paddle-Signature');
+    const secret = mustEnv('PADDLE_WEBHOOK_SECRET');
 
-    const event = JSON.parse(rawBody.toString('utf8'));
+    const ok = this.verifyPaddleSignature(rawBody, signature, secret);
+    if (!ok) {
+      this.logger.warn(`Invalid Paddle-Signature. Header=${signature}`);
+      throw new BadRequestException('Invalid Paddle-Signature');
+    }
+
+    let event: any;
+    try {
+      event = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      throw new BadRequestException('Invalid JSON payload');
+    }
 
     const eventType = event?.event_type;
     const data = event?.data;
 
-    // Важливі івенти:
-    // - transaction.completed / transaction.updated
-    // - subscription.created / subscription.activated / subscription.updated / subscription.canceled
-    // (точні назви залежать від destination налаштувань; Paddle описує lifecycle тут) :contentReference[oaicite:6]{index=6}
-
     this.logger.log(`Paddle webhook: ${eventType}`);
 
-    // 1) Якщо прийшла subscription.created/activated -> привʼяжемо subscriptionId до користувача
-    const paddleSubId = data?.id; // у subscription.* data.id = subscription_id
-    const txIdFromSub = data?.transaction_id; // Paddle дає transaction_id у subscription.created :contentReference[oaicite:7]{index=7}
+    // 1) subscription.created/activated often includes transaction_id
+    const paddleSubId = data?.id;
+    const txIdFromSub = data?.transaction_id;
 
     if (paddleSubId && txIdFromSub) {
       const sub = await this.prisma.subscription.findFirst({
@@ -156,9 +196,6 @@ export class BillingService {
             paddleSubscriptionId: String(paddleSubId),
             paddleStatus: status,
             status: /active|trialing/i.test(status) ? 'active' : 'pending',
-            planId: sub.paddlePriceId
-              ? sub.planId // план вже визначений тобою при checkout
-              : sub.planId,
             currentPeriodStart: periodStart ?? sub.currentPeriodStart,
             currentPeriodEnd: periodEnd ?? sub.currentPeriodEnd,
           },
@@ -168,8 +205,8 @@ export class BillingService {
       return;
     }
 
-    // 2) Якщо subscription.updated/canceled/past_due — шукаємо по paddleSubscriptionId
-    const subId = data?.id; // subscription id
+    // 2) subscription.updated/canceled/past_due — find by paddleSubscriptionId
+    const subId = data?.id;
     if (subId) {
       const local = await this.prisma.subscription.findFirst({
         where: { paddleSubscriptionId: String(subId) },
@@ -177,9 +214,8 @@ export class BillingService {
       if (!local) return;
 
       const status = String(data?.status ?? '');
-      const cancelAtPeriodEnd = Boolean(
-        data?.scheduled_change?.action === 'cancel',
-      ); // Paddle використовує scheduled_change для cancel at period end :contentReference[oaicite:8]{index=8}
+      const cancelAtPeriodEnd =
+        data?.scheduled_change?.action === 'cancel' ? true : false;
 
       const periodStart = data?.current_billing_period?.starts_at
         ? new Date(data.current_billing_period.starts_at)
@@ -219,74 +255,105 @@ export class BillingService {
       throw new BadRequestException('No Paddle subscription to cancel');
     }
 
-    // Викликаємо Paddle cancel endpoint
-    // За докою: default = cancel at end of billing period; можна effective_from=immediately :contentReference[oaicite:5]{index=5}
-    const { data } = await this.paddle.post(
-      `/subscriptions/${sub.paddleSubscriptionId}/cancel`,
-      {
-        effective_from:
-          input.effectiveFrom === 'immediately'
-            ? 'immediately'
-            : 'next_billing_period',
-      },
-    );
+    try {
+      const { data } = await this.paddle.post(
+        `/subscriptions/${sub.paddleSubscriptionId}/cancel`,
+        {
+          effective_from:
+            input.effectiveFrom === 'immediately'
+              ? 'immediately'
+              : 'next_billing_period',
+        },
+      );
 
-    const updated = data?.data;
-    const paddleStatus = String(updated?.status ?? '');
-    const scheduledAction = updated?.scheduled_change?.action ?? null;
+      const updated = data?.data;
+      const paddleStatus = String(updated?.status ?? '');
+      const scheduledAction = updated?.scheduled_change?.action ?? null;
 
-    const cancelAtPeriodEnd =
-      input.effectiveFrom !== 'immediately' &&
-      (scheduledAction === 'cancel' || scheduledAction == null);
+      const cancelAtPeriodEnd =
+        input.effectiveFrom !== 'immediately' &&
+        (scheduledAction === 'cancel' || scheduledAction == null);
 
-    const periodStart = updated?.current_billing_period?.starts_at
-      ? new Date(updated.current_billing_period.starts_at)
-      : null;
-    const periodEnd = updated?.current_billing_period?.ends_at
-      ? new Date(updated.current_billing_period.ends_at)
-      : null;
+      const periodStart = updated?.current_billing_period?.starts_at
+        ? new Date(updated.current_billing_period.starts_at)
+        : null;
+      const periodEnd = updated?.current_billing_period?.ends_at
+        ? new Date(updated.current_billing_period.ends_at)
+        : null;
 
-    await this.prisma.subscription.update({
-      where: { id: sub.id },
-      data: {
+      await this.prisma.subscription.update({
+        where: { id: sub.id },
+        data: {
+          paddleStatus,
+          cancelAtPeriodEnd,
+          status:
+            input.effectiveFrom === 'immediately'
+              ? 'canceled'
+              : sub.status === 'pending'
+                ? 'pending'
+                : 'active',
+          currentPeriodStart: periodStart ?? sub.currentPeriodStart,
+          currentPeriodEnd: periodEnd ?? sub.currentPeriodEnd,
+          planId: input.effectiveFrom === 'immediately' ? 'FREE' : sub.planId,
+        },
+      });
+
+      return {
+        ok: true,
+        effectiveFrom: input.effectiveFrom,
         paddleStatus,
         cancelAtPeriodEnd,
-        // internal status:
-        // - якщо immediately → можна одразу "canceled"
-        // - якщо end-of-period → лишається active до дати (Paddle так і робить) :contentReference[oaicite:6]{index=6}
-        status:
-          input.effectiveFrom === 'immediately'
-            ? 'canceled'
-            : sub.status === 'pending'
-              ? 'pending'
-              : 'active',
-        currentPeriodStart: periodStart ?? sub.currentPeriodStart,
-        currentPeriodEnd: periodEnd ?? sub.currentPeriodEnd,
-        // якщо cancel immediately — логічно повернути FREE одразу (або в webhook)
-        planId: input.effectiveFrom === 'immediately' ? 'FREE' : sub.planId,
-      },
-    });
-
-    return {
-      ok: true,
-      effectiveFrom: input.effectiveFrom,
-      paddleStatus,
-      cancelAtPeriodEnd,
-      currentPeriodEnd: periodEnd,
-    };
+        currentPeriodEnd: periodEnd,
+      };
+    } catch (e: any) {
+      const paddlePayload = e?.response?.data;
+      this.logger.error(
+        `Paddle cancel failed: ${JSON.stringify(paddlePayload ?? e?.message ?? e)}`,
+      );
+      throw new BadRequestException(
+        paddlePayload?.error?.detail ??
+          paddlePayload?.message ??
+          'Failed to cancel subscription',
+      );
+    }
   }
 
-  // ⚠️ Псевдо-верифікація. Для production краще використовувати офіційний спосіб із доки/SDK.
-  // Основна вимога Paddle: перевіряти підпис по RAW body і Paddle-Signature. :contentReference[oaicite:9]{index=9}
+  /**
+   * ✅ Real Paddle signature verification:
+   * Header example: "ts=1700000000;h1=abcdef..."
+   * Signature: HMAC_SHA256(secret, `${ts}:${rawBody}`)
+   */
   private verifyPaddleSignature(
     rawBody: Buffer,
     header: string,
     secret: string,
   ) {
-    // Paddle рекомендує офіційні SDK для коректної перевірки. :contentReference[oaicite:10]{index=10}
-    // Тут залишаю заглушку, щоб ти не завис — але я реально раджу замінити на SDK-verify.
+    const parts = header.split(';').map((p) => p.trim());
+    const tsPart = parts.find((p) => p.startsWith('ts='));
+    const h1Part = parts.find((p) => p.startsWith('h1='));
 
-    // Поверни false, доки не підключиш SDK verify (нижче дам варіант).
-    return true;
+    if (!tsPart || !h1Part) return false;
+
+    const ts = tsPart.slice(3);
+    const h1 = h1Part.slice(3);
+
+    const signedPayload = Buffer.concat([
+      Buffer.from(`${ts}:`, 'utf8'),
+      rawBody,
+    ]);
+
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(signedPayload)
+      .digest('hex');
+
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(expected, 'hex'),
+        Buffer.from(h1, 'hex'),
+      );
+    } catch {
+      return false;
+    }
   }
 }

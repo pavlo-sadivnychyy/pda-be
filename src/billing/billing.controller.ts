@@ -9,6 +9,10 @@ import {
   Headers,
   HttpCode,
 } from '@nestjs/common';
+
+import type { RawBodyRequest } from '@nestjs/common';
+import type { Request } from 'express';
+
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 import { PlanId } from '@prisma/client';
 import { BillingService } from './billing.service';
@@ -44,7 +48,6 @@ export class BillingController {
     return this.billing.getMySubscription(req.authUserId);
   }
 
-  // ✅ НОВЕ: cancel
   @Post('paddle/cancel')
   @UseGuards(ClerkAuthGuard)
   async cancelMySubscription(
@@ -60,7 +63,7 @@ export class BillingController {
   @Post('paddle/webhook')
   @HttpCode(200)
   async paddleWebhook(
-    @Req() req: any,
+    @Req() req: RawBodyRequest<Request>,
     @Headers('paddle-signature') paddleSignature?: string,
     @Headers('Paddle-Signature') paddleSignatureAlt?: string,
   ) {

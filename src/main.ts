@@ -1,10 +1,10 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import * as process from 'node:process';
-import * as bodyParser from 'body-parser';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // ✅ IMPORTANT: enables req.rawBody for webhook signature verification
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   const allowedOrigins = [
     'http://localhost:3001',
@@ -25,31 +25,11 @@ async function bootstrap() {
     allowedHeaders: [
       'Content-Type',
       'Authorization',
-      // ✅ Paddle webhook signature header (та інколи фронт теж може прокидати)
+      // Paddle webhook signature header
       'Paddle-Signature',
       'paddle-signature',
     ],
   });
-
-  // ✅ важливо для Paddle: зберігаємо rawBody точно як прийшло
-  app.use(
-    bodyParser.json({
-      limit: '2mb',
-      verify: (req: any, _res, buf: Buffer) => {
-        req.rawBody = buf;
-      },
-    }),
-  );
-
-  app.use(
-    bodyParser.urlencoded({
-      extended: true,
-      limit: '2mb',
-      verify: (req: any, _res, buf: Buffer) => {
-        req.rawBody = buf;
-      },
-    }),
-  );
 
   await app.listen(process.env.PORT || 3000);
 }
