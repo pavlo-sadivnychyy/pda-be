@@ -85,7 +85,7 @@ export class BillingService {
       update: {},
     });
 
-    const frontendUrl = process.env.FRONTEND_URL; // https://dev.spravly.com
+    const frontendUrl = process.env.APP_PUBLIC_URL; // https://dev.spravly.com
     if (!frontendUrl) {
       throw new InternalServerErrorException('FRONTEND_URL is not set');
     }
