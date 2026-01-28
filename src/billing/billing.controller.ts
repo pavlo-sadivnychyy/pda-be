@@ -1,57 +1,35 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Post,
-  Req,
-  Headers,
-  HttpCode,
-  UseGuards,
-  BadRequestException,
-} from '@nestjs/common';
-import type { RawBodyRequest } from '@nestjs/common';
-import type { Request } from 'express';
-
+import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
 import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
-import { PlanId } from '@prisma/client';
 import { BillingService } from './billing.service';
+import { PlanId } from '@prisma/client';
 
 class CreateCheckoutDto {
   planId: PlanId;
 }
 
-@Controller('billing')
+@Controller('billing/paddle')
 export class BillingController {
   constructor(private readonly billing: BillingService) {}
 
-  @Post('paddle/checkout')
+  @Post('checkout')
   @UseGuards(ClerkAuthGuard)
   async createCheckout(@Req() req: any, @Body() body: CreateCheckoutDto) {
-    if (!body.planId) throw new BadRequestException('planId required');
-    if (body.planId === 'FREE')
-      throw new BadRequestException('FREE plan has no checkout');
-
     return this.billing.createCheckout({
       authUserId: req.authUserId,
       planId: body.planId,
     });
   }
 
-  @Get('paddle/my-subscription')
+  // optional: endpoint to "sync" after success (front calls it on /checkout page)
+  @Post('sync-transaction')
   @UseGuards(ClerkAuthGuard)
-  async mySubscription(@Req() req: any) {
-    return this.billing.getMySubscription(req.authUserId);
-  }
-
-  @Post('paddle/webhook')
-  @HttpCode(200)
-  async webhook(
-    @Req() req: RawBodyRequest<Request>,
-    @Headers('paddle-signature') sig?: string,
-    @Headers('Paddle-Signature') sigAlt?: string,
+  async syncTransaction(
+    @Req() req: any,
+    @Body() body: { transactionId: string },
   ) {
-    const signature = sig ?? sigAlt;
-    await this.billing.handlePaddleWebhook(req.rawBody, signature);
-    return { ok: true };
+    return this.billing.syncTransactionToDb({
+      authUserId: req.authUserId,
+      transactionId: body.transactionId,
+    });
   }
 }
