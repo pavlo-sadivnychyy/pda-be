@@ -22,15 +22,31 @@ async function bootstrap() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      // ✅ Paddle webhook signature header (та інколи фронт теж може прокидати)
+      'Paddle-Signature',
+      'paddle-signature',
+    ],
   });
 
+  // ✅ важливо для Paddle: зберігаємо rawBody точно як прийшло
   app.use(
     bodyParser.json({
+      limit: '2mb',
       verify: (req: any, _res, buf: Buffer) => {
-        if (req.originalUrl === '/billing/monobank/webhook') {
-          req.rawBody = buf;
-        }
+        req.rawBody = buf;
+      },
+    }),
+  );
+
+  app.use(
+    bodyParser.urlencoded({
+      extended: true,
+      limit: '2mb',
+      verify: (req: any, _res, buf: Buffer) => {
+        req.rawBody = buf;
       },
     }),
   );

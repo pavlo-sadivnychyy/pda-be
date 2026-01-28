@@ -244,19 +244,16 @@ model Subscription {
 
   planId PlanId @default(FREE)
 
-  status            String   @default("active") // твій внутрішній статус
+  status             String   @default("active")
   currentPeriodStart DateTime?
   currentPeriodEnd   DateTime?
-  cancelAtPeriodEnd  Boolean @default(false)
+  cancelAtPeriodEnd  Boolean  @default(false)
 
-  // ===== monobank =====
-  monoSubscriptionId String? @unique
-  monoStatus         String?
-  planIdPending      PlanId?
-
-  // (старі stripe поля можеш потім видалити)
-  stripeCustomerId     String?
-  stripeSubscriptionId String?
+  paddleCustomerId      String?
+  paddleTransactionId   String? @unique
+  paddleSubscriptionId  String? @unique
+  paddleStatus          String?
+  paddlePriceId         String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
