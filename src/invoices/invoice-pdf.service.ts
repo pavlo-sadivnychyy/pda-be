@@ -7,6 +7,29 @@ import { FileStorageService } from '../file-storage/file-storage.service';
 
 type PdfKind = 'UA' | 'INTERNATIONAL';
 
+type SupplierSnapshot = {
+  displayName: string;
+  addressLine: string;
+  cityCountry: string;
+  regLabel: string;
+  regValue: string;
+  taxLabel: string;
+  taxValue: string;
+  email: string;
+  phone: string;
+};
+
+type PaymentSnapshot = {
+  beneficiaryLine: string; // "Отримувач: X" / "Beneficiary: X"
+  iban: string;
+  swift: string;
+  bankName: string;
+  bankAddress: string;
+  account: string;
+  mfo: string;
+  referenceLine: string; // "Призначення: ..." / "Reference: ..."
+};
+
 @Injectable()
 export class InvoicePdfService {
   constructor(
@@ -162,41 +185,72 @@ export class InvoicePdfService {
     });
   }
 
-  private buildSupplierLines(org: any, lang: 'UA' | 'EN'): string[] {
-    const name =
-      org?.beneficiaryName ||
-      org?.legalName ||
-      org?.name ||
-      (lang === 'UA' ? '—' : '—');
-    const address = org?.legalAddress || '';
+  // ==================================================
+  // ✅ NEW: choose correct fields by PDF kind
+  // ==================================================
+  private pickSupplier(org: any, kind: PdfKind): SupplierSnapshot {
     const cityCountry = [org?.city, org?.country].filter(Boolean).join(', ');
-    const reg = org?.registrationNumber || '';
-    const vat = org?.vatId || '';
+    const email = org?.primaryContactEmail || '';
+    const phone = org?.primaryContactPhone || '';
+
+    if (kind === 'UA') {
+      const displayName =
+        org?.uaCompanyName || org?.uaBeneficiaryName || org?.name || '—';
+      const addressLine = org?.uaCompanyAddress || '';
+      return {
+        displayName,
+        addressLine,
+        cityCountry,
+        regLabel: 'ЄДРПОУ',
+        regValue: org?.uaEdrpou || '',
+        taxLabel: 'ІПН',
+        taxValue: org?.uaIpn || '',
+        email,
+        phone,
+      };
+    }
+
+    // INTERNATIONAL
+    const displayName =
+      org?.intlLegalName || org?.intlBeneficiaryName || org?.name || '—';
+    const addressLine = org?.intlLegalAddress || '';
+    return {
+      displayName,
+      addressLine,
+      cityCountry,
+      regLabel: 'Reg. No',
+      regValue: org?.intlRegistrationNumber || '',
+      taxLabel: 'VAT/Tax ID',
+      taxValue: org?.intlVatId || '',
+      email,
+      phone,
+    };
+  }
+
+  private buildSupplierLines(
+    org: any,
+    kind: PdfKind,
+    lang: 'UA' | 'EN',
+  ): string[] {
+    const s = this.pickSupplier(org, kind);
 
     const lines: string[] = [];
-    lines.push(name);
+    lines.push(s.displayName);
 
-    const addrLine = [address, cityCountry].filter(Boolean).join(', ');
+    const addrLine = [s.addressLine, s.cityCountry].filter(Boolean).join(', ');
     if (addrLine) lines.push(addrLine);
 
-    if (org?.primaryContactEmail)
-      lines.push(
-        `${lang === 'UA' ? 'Email' : 'Email'}: ${org.primaryContactEmail}`,
-      );
-    if (org?.primaryContactPhone)
-      lines.push(
-        `${lang === 'UA' ? 'Тел' : 'Phone'}: ${org.primaryContactPhone}`,
-      );
+    if (s.email) lines.push(`Email: ${s.email}`);
+    if (s.phone) lines.push(`${lang === 'UA' ? 'Тел' : 'Phone'}: ${s.phone}`);
 
-    if (reg)
-      lines.push(`${lang === 'UA' ? 'ЄДРПОУ/Reg. No' : 'Reg. No'}: ${reg}`);
-    if (vat) lines.push(`${lang === 'UA' ? 'ІПН/VAT' : 'VAT/Tax ID'}: ${vat}`);
+    if (s.regValue) lines.push(`${s.regLabel}: ${s.regValue}`);
+    if (s.taxValue) lines.push(`${s.taxLabel}: ${s.taxValue}`);
 
-    return lines;
+    return lines.length ? lines : ['—'];
   }
 
   private buildBuyerLines(client: any, lang: 'UA' | 'EN'): string[] {
-    if (!client) return [lang === 'UA' ? '—' : '—'];
+    if (!client) return ['—'];
 
     const lines: string[] = [];
     if (client.name) lines.push(client.name);
@@ -212,48 +266,93 @@ export class InvoicePdfService {
       );
     }
 
-    return lines.length ? lines : [lang === 'UA' ? '—' : '—'];
+    return lines.length ? lines : ['—'];
+  }
+
+  private pickPayment(
+    org: any,
+    invoice: any,
+    kind: PdfKind,
+    lang: 'UA' | 'EN',
+  ): PaymentSnapshot {
+    if (kind === 'UA') {
+      const beneficiary =
+        org?.uaBeneficiaryName || org?.uaCompanyName || org?.name || '—';
+      const iban = this.formatIban(org?.uaIban);
+      const bankName = org?.uaBankName || '';
+      const mfo = org?.uaMfo || '';
+      const account = org?.uaAccountNumber || '';
+      const reference =
+        (org?.uaPaymentPurposeHint?.trim?.() as string) ||
+        `Оплата за інвойсом № ${invoice?.number ?? ''}`;
+
+      return {
+        beneficiaryLine: `Отримувач: ${beneficiary}`,
+        iban,
+        swift: '', // UA зазвичай не показуємо SWIFT
+        bankName,
+        bankAddress: '', // UA блок окремо не просив адресу банку
+        account,
+        mfo,
+        referenceLine: `Призначення: ${reference}`.trim(),
+      };
+    }
+
+    // INTERNATIONAL
+    const beneficiary =
+      org?.intlBeneficiaryName || org?.intlLegalName || org?.name || '—';
+
+    const iban = this.formatIban(org?.intlIban);
+    const swift = org?.intlSwiftBic || '';
+    const bankName = org?.intlBankName || '';
+    const bankAddress = org?.intlBankAddress || '';
+    const reference =
+      (org?.intlPaymentReferenceHint?.trim?.() as string) ||
+      `Payment for invoice No ${invoice?.number ?? ''}`;
+
+    return {
+      beneficiaryLine: `Beneficiary: ${beneficiary}`,
+      iban,
+      swift,
+      bankName,
+      bankAddress,
+      account: '', // міжнародний — не використовуємо локальний рахунок
+      mfo: '',
+      referenceLine: `Reference: ${reference}`.trim(),
+    };
   }
 
   private buildPaymentLines(
     org: any,
     invoice: any,
+    kind: PdfKind,
     lang: 'UA' | 'EN',
   ): string[] {
-    const beneficiary =
-      org?.beneficiaryName || org?.legalName || org?.name || '—';
-    const iban = this.formatIban(org?.iban);
-    const swift = org?.swiftBic || org?.swift || '';
-    const bankName = org?.bankName || '';
-    const bankAddr = org?.bankAddress || '';
-    const acc = org?.bankAccountNumber || ''; // якщо маєш окреме поле
-    const reference = (
-      org?.paymentReferenceHint?.trim() ||
-      (lang === 'UA'
-        ? `Оплата за інвойсом № ${invoice?.number ?? ''}`
-        : `Payment for invoice No ${invoice?.number ?? ''}`)
-    ).trim();
+    const p = this.pickPayment(org, invoice, kind, lang);
 
     const lines: string[] = [];
-    lines.push(
-      `${lang === 'UA' ? 'Отримувач' : 'Beneficiary'}: ${beneficiary}`,
-    );
-    if (iban) lines.push(`IBAN: ${iban}`);
-    if (acc) lines.push(`${lang === 'UA' ? 'Рахунок' : 'Account'}: ${acc}`);
-    if (swift) lines.push(`SWIFT/BIC: ${swift}`);
-    if (bankName) lines.push(`${lang === 'UA' ? 'Банк' : 'Bank'}: ${bankName}`);
-    if (bankAddr)
-      lines.push(
-        `${lang === 'UA' ? 'Адреса банку' : 'Bank address'}: ${bankAddr}`,
-      );
-    lines.push(`${lang === 'UA' ? 'Призначення' : 'Reference'}: ${reference}`);
+    lines.push(p.beneficiaryLine);
+
+    if (p.iban) lines.push(`IBAN: ${p.iban}`);
+
+    if (kind === 'UA') {
+      if (p.bankName) lines.push(`Банк: ${p.bankName}`);
+      if (p.mfo) lines.push(`МФО: ${p.mfo}`);
+      if (p.account) lines.push(`Рахунок (якщо треба): ${p.account}`);
+      lines.push(p.referenceLine);
+      return lines;
+    }
+
+    // INTERNATIONAL
+    if (p.swift) lines.push(`SWIFT/BIC: ${p.swift}`);
+    if (p.bankName) lines.push(`Bank: ${p.bankName}`);
+    if (p.bankAddress) lines.push(`Bank address: ${p.bankAddress}`);
+    lines.push(p.referenceLine);
 
     return lines;
   }
 
   private buildSubject(invoice: any): string {
-    // Якщо маєш invoice.subject — підстав сюди.
-    // Зараз зробимо “по-простому”: або industry, або “Services”.
     const org = invoice?.organization ?? {};
     const fromOrg = (org?.industry || '').trim();
     if (fromOrg) return fromOrg;
@@ -315,7 +414,6 @@ export class InvoicePdfService {
 
       const org = invoice.organization ?? {};
 
-      // Header line like: "Invoice / Інвойс № ..."
       doc.font('BodyBold').fontSize(12);
       doc.text(`Інвойс № ${invoice.number}`, left, top, { align: 'left' });
 
@@ -324,24 +422,17 @@ export class InvoicePdfService {
         `Дата інвойсу: ${this.formatDateISO(invoice.issueDate)}`,
         left,
         top,
-        {
-          align: 'right',
-          width: usableW,
-        },
+        { align: 'right', width: usableW },
       );
 
       doc.moveDown(0.8);
 
-      // Blocks layout (like on screenshot): 2 columns
       const colGap = 10;
       const colW = Math.floor((usableW - colGap) / 2);
-
       const xL = left;
       const xR = left + colW + colGap;
-
       let y = doc.y;
 
-      // Row 1: Supplier (left) / Invoice meta (right)
       const row1H = 86;
       this.drawLabelValueBlock(
         doc,
@@ -350,7 +441,7 @@ export class InvoicePdfService {
         colW,
         row1H,
         'Виконавець',
-        this.buildSupplierLines(org, 'UA'),
+        this.buildSupplierLines(org, 'UA', 'UA'),
         'UA',
       );
 
@@ -373,7 +464,6 @@ export class InvoicePdfService {
 
       y += row1H;
 
-      // Row 2: Buyer full width
       const row2H = 74;
       this.drawLabelValueBlock(
         doc,
@@ -387,9 +477,7 @@ export class InvoicePdfService {
       );
       y += row2H;
 
-      // Row 3: Subject/Currency/Price/Terms (left) + Payment details (right)
       const row3H = 108;
-
       const subject = this.buildSubject(invoice);
       const totalStr = this.formatMoney(invoice.total);
       const termsPay =
@@ -422,16 +510,15 @@ export class InvoicePdfService {
         colW,
         row3H,
         'Реквізити для оплати',
-        this.buildPaymentLines(org, invoice, 'UA'),
+        this.buildPaymentLines(org, invoice, 'UA', 'UA'),
         'UA',
       );
 
       y += row3H + 10;
 
-      // Items table
+      // ===== items table (unchanged) =====
       const tableX = left;
       const tableW = usableW;
-
       const headerH = 22;
       const rowH = 22;
 
@@ -511,7 +598,6 @@ export class InvoicePdfService {
       let idx = 1;
 
       for (const it of items) {
-        // if not enough space -> new page with header again
         if (tableY + rowH > maxTableBottom) {
           doc.addPage();
           tableY = doc.page.margins.top;
@@ -519,10 +605,7 @@ export class InvoicePdfService {
           tableY += headerH;
         }
 
-        // row outer box
         this.strokeRect(doc, tableX, tableY, tableW, rowH);
-
-        // vertical separators
         doc
           .moveTo(colX.desc, tableY)
           .lineTo(colX.desc, tableY + rowH)
@@ -543,8 +626,6 @@ export class InvoicePdfService {
         const qty = it.quantity ?? 0;
         const rate = this.formatMoney(it.unitPrice);
         const amount = this.formatMoney(it.lineTotal);
-
-        // description (name + optional description)
         const descText = [it.name, it.description].filter(Boolean).join('\n');
 
         this.drawCell(doc, colX.no, tableY, cols.no, rowH, String(idx), {
@@ -581,10 +662,8 @@ export class InvoicePdfService {
         idx += 1;
       }
 
-      // Totals row (like screenshot bottom)
       const totalsH = 22;
 
-      // ensure space for totals block
       if (
         tableY + totalsH * 2 + 24 >
         doc.page.height - doc.page.margins.bottom
@@ -593,7 +672,6 @@ export class InvoicePdfService {
         tableY = doc.page.margins.top;
       }
 
-      // Total line (right side)
       const subtotalVal =
         `${this.formatMoney(invoice.subtotal)} ${invoice.currency ?? ''}`.trim();
       const vatVal =
@@ -621,11 +699,7 @@ export class InvoicePdfService {
           tableW - cols.amt,
           totalsH,
           row.label,
-          {
-            align: 'right',
-            valign: 'middle',
-            bold: row.bold,
-          },
+          { align: 'right', valign: 'middle', bold: row.bold },
         );
         this.drawCell(doc, colX.amt, tableY, cols.amt, totalsH, row.value, {
           align: 'center',
@@ -638,13 +712,10 @@ export class InvoicePdfService {
 
       doc.y = tableY + 18;
 
-      // Terms + signature on page 2 (or same if fits)
-      const termsLines = this.termsUA(String(invoice.number ?? ''));
-      const termsText = termsLines.join('\n');
+      const termsText = this.termsUA(String(invoice.number ?? '')).join('\n');
 
       this.ensureSpace(doc, 260);
 
-      // if still close to bottom -> new page for terms
       const bottomY = doc.page.height - doc.page.margins.bottom;
       if (doc.y + 240 > bottomY) {
         doc.addPage();
@@ -652,14 +723,10 @@ export class InvoicePdfService {
       }
 
       doc.font('Body').fontSize(9.5);
-      doc.text(termsText, left, doc.y, {
-        width: usableW,
-        lineGap: 1.2,
-      });
+      doc.text(termsText, left, doc.y, { width: usableW, lineGap: 1.2 });
 
       doc.moveDown(2);
 
-      // Signature line
       const signerName =
         invoice?.createdBy?.fullName ||
         invoice?.createdBy?.name ||
@@ -672,7 +739,6 @@ export class InvoicePdfService {
       doc.font('Body').fontSize(10);
       doc.text(signLabel, left, signY);
 
-      // line
       const lineX1 = left + 78;
       const lineX2 = left + 250;
       doc
@@ -680,12 +746,14 @@ export class InvoicePdfService {
         .lineTo(lineX2, signY + 12)
         .stroke();
 
-      // name at right
       doc.text(
         signerName ? `(${signerName})` : '',
         left + usableW - 220,
         signY,
-        { width: 220, align: 'right' },
+        {
+          width: 220,
+          align: 'right',
+        },
       );
 
       doc.end();
@@ -711,7 +779,6 @@ export class InvoicePdfService {
 
       const org = invoice.organization ?? {};
 
-      // Header line like screenshot
       doc.font('BodyBold').fontSize(12);
       doc.text(`Invoice No ${invoice.number}`, left, top, { align: 'left' });
 
@@ -720,25 +787,18 @@ export class InvoicePdfService {
         `Date of invoice: ${this.formatDateISO(invoice.issueDate)}`,
         left,
         top,
-        {
-          align: 'right',
-          width: usableW,
-        },
+        { align: 'right', width: usableW },
       );
 
       doc.moveDown(0.8);
 
-      // 2-column blocks
       const colGap = 10;
       const colW = Math.floor((usableW - colGap) / 2);
-
       const xL = left;
       const xR = left + colW + colGap;
-
       let y = doc.y;
 
       const row1H = 86;
-
       this.drawLabelValueBlock(
         doc,
         xL,
@@ -746,7 +806,7 @@ export class InvoicePdfService {
         colW,
         row1H,
         'Supplier',
-        this.buildSupplierLines(org, 'EN'),
+        this.buildSupplierLines(org, 'INTERNATIONAL', 'EN'),
         'EN',
       );
 
@@ -780,7 +840,6 @@ export class InvoicePdfService {
         this.buildBuyerLines(invoice.client, 'EN'),
         'EN',
       );
-
       y += row2H;
 
       const row3H = 108;
@@ -817,16 +876,15 @@ export class InvoicePdfService {
         colW,
         row3H,
         'Payment details',
-        this.buildPaymentLines(org, invoice, 'EN'),
+        this.buildPaymentLines(org, invoice, 'INTERNATIONAL', 'EN'),
         'EN',
       );
 
       y += row3H + 10;
 
-      // Items table: №, Description, Hours(Qty), Rate, Amount
+      // ===== items table (unchanged) =====
       const tableX = left;
       const tableW = usableW;
-
       const headerH = 22;
       const rowH = 22;
 
@@ -879,7 +937,7 @@ export class InvoicePdfService {
           bold: true,
           valign: 'middle',
         });
-        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Amount', {
+        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Qty', {
           bold: true,
           align: 'center',
           valign: 'middle',
@@ -934,7 +992,6 @@ export class InvoicePdfService {
         const qty = it.quantity ?? 0;
         const rate = this.formatMoney(it.unitPrice);
         const amount = this.formatMoney(it.lineTotal);
-
         const descText = [it.name, it.description].filter(Boolean).join('\n');
 
         this.drawCell(doc, colX.no, tableY, cols.no, rowH, String(idx), {
@@ -971,7 +1028,6 @@ export class InvoicePdfService {
         idx += 1;
       }
 
-      // Totals rows like screenshot
       const totalsH = 22;
 
       if (
@@ -1009,11 +1065,7 @@ export class InvoicePdfService {
           tableW - cols.amt,
           totalsH,
           row.label,
-          {
-            align: 'right',
-            valign: 'middle',
-            bold: row.bold,
-          },
+          { align: 'right', valign: 'middle', bold: row.bold },
         );
         this.drawCell(doc, colX.amt, tableY, cols.amt, totalsH, row.value, {
           align: 'center',
@@ -1026,9 +1078,7 @@ export class InvoicePdfService {
 
       doc.y = tableY + 18;
 
-      // Terms + signature
-      const termsLines = this.termsEN(String(invoice.number ?? ''));
-      const termsText = termsLines.join('\n');
+      const termsText = this.termsEN(String(invoice.number ?? '')).join('\n');
 
       this.ensureSpace(doc, 260);
 
@@ -1039,10 +1089,7 @@ export class InvoicePdfService {
       }
 
       doc.font('Body').fontSize(9.5);
-      doc.text(termsText, left, doc.y, {
-        width: usableW,
-        lineGap: 1.15,
-      });
+      doc.text(termsText, left, doc.y, { width: usableW, lineGap: 1.15 });
 
       doc.moveDown(2);
 

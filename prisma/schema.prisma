@@ -153,29 +153,45 @@ model Organization {
   country             String?
   city                String?
   timeZone            String?
-  defaultLanguage     String? // "uk"
-  defaultCurrency     String? // "UAH"
+  defaultLanguage     String?
+  defaultCurrency     String?
   primaryContactName  String?
   primaryContactEmail String?
   primaryContactPhone String?
 
-  // Нові поля бізнес-профілю організації
   businessNiche       String?
   servicesDescription String?
   targetAudience      String?
   brandStyle          String?
 
-  // ✅ International payment details (NEW)
-  legalName            String?
-  legalAddress         String?
-  vatId                String?
-  registrationNumber   String?
-  iban                 String?
-  swiftBic             String?
-  bankName             String?
-  bankAddress          String?
-  beneficiaryName      String?
-  paymentReferenceHint String?
+  // =========================
+  // ✅ UA payment details (NEW)
+  // =========================
+  uaCompanyName          String? // Назва компанії/ФОП (UA)
+  uaCompanyAddress       String? // Адреса (UA)
+  uaEdrpou               String? // ЄДРПОУ
+  uaIpn                  String? // ІПН (якщо треба)
+  uaIban                 String?
+  uaBankName             String?
+  uaMfo                  String? // МФО (часто треба в UA реквізитах)
+  uaAccountNumber        String? // якщо десь ще використовуєш не-IBAN
+  uaBeneficiaryName      String? // Отримувач (UA)
+  uaPaymentPurposeHint   String? // Призначення платежу (UA)
+
+  // ==================================
+  // ✅ International payment details
+  // (RENAMED from your current fields)
+  // ==================================
+  intlLegalName            String?
+  intlLegalAddress         String?
+  intlVatId                String?
+  intlRegistrationNumber   String?
+  intlIban                 String?
+  intlSwiftBic             String?
+  intlBankName             String?
+  intlBankAddress          String?
+  intlBeneficiaryName      String?
+  intlPaymentReferenceHint String?
 
   ownerId String @unique
   owner   User   @relation("OwnerOrganizations", fields: [ownerId], references: [id])
@@ -195,6 +211,7 @@ model Organization {
   invoiceReminders InvoiceReminderLog[] @relation("InvoiceReminderToOrg")
   activityLogs     ActivityLog[]
 }
+
 
 // ---- UserOrganization ----
 

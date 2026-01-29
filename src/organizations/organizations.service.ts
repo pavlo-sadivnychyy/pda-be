@@ -1,3 +1,5 @@
+// organizations.service.ts
+
 import {
   BadRequestException,
   ForbiddenException,
@@ -28,18 +30,35 @@ type CreateOrganizationInput = {
   targetAudience?: string | null;
   brandStyle?: string | null;
 
-  // ✅ payment details
-  legalName?: string | null;
-  beneficiaryName?: string | null;
-  legalAddress?: string | null;
-  vatId?: string | null;
-  registrationNumber?: string | null;
-  iban?: string | null;
-  swiftBic?: string | null;
-  bankName?: string | null;
-  bankAddress?: string | null;
-  paymentReferenceHint?: string | null;
+  // =========================
+  // ✅ UA payment details
+  // =========================
+  uaCompanyName?: string | null;
+  uaCompanyAddress?: string | null;
+  uaEdrpou?: string | null;
+  uaIpn?: string | null;
+  uaIban?: string | null;
+  uaBankName?: string | null;
+  uaMfo?: string | null;
+  uaAccountNumber?: string | null;
+  uaBeneficiaryName?: string | null;
+  uaPaymentPurposeHint?: string | null;
 
+  // =========================
+  // ✅ International payment details
+  // =========================
+  intlLegalName?: string | null;
+  intlBeneficiaryName?: string | null;
+  intlLegalAddress?: string | null;
+  intlVatId?: string | null;
+  intlRegistrationNumber?: string | null;
+  intlIban?: string | null;
+  intlSwiftBic?: string | null;
+  intlBankName?: string | null;
+  intlBankAddress?: string | null;
+  intlPaymentReferenceHint?: string | null;
+
+  // brand profile fields
   tagline?: string | null;
   niche?: string | null;
   longDescription?: string | null;
@@ -61,18 +80,35 @@ type UpdateOrganizationInput = {
   targetAudience?: string | null;
   brandStyle?: string | null;
 
-  // ✅ payment details
-  legalName?: string | null;
-  beneficiaryName?: string | null;
-  legalAddress?: string | null;
-  vatId?: string | null;
-  registrationNumber?: string | null;
-  iban?: string | null;
-  swiftBic?: string | null;
-  bankName?: string | null;
-  bankAddress?: string | null;
-  paymentReferenceHint?: string | null;
+  // =========================
+  // ✅ UA payment details
+  // =========================
+  uaCompanyName?: string | null;
+  uaCompanyAddress?: string | null;
+  uaEdrpou?: string | null;
+  uaIpn?: string | null;
+  uaIban?: string | null;
+  uaBankName?: string | null;
+  uaMfo?: string | null;
+  uaAccountNumber?: string | null;
+  uaBeneficiaryName?: string | null;
+  uaPaymentPurposeHint?: string | null;
 
+  // =========================
+  // ✅ International payment details
+  // =========================
+  intlLegalName?: string | null;
+  intlBeneficiaryName?: string | null;
+  intlLegalAddress?: string | null;
+  intlVatId?: string | null;
+  intlRegistrationNumber?: string | null;
+  intlIban?: string | null;
+  intlSwiftBic?: string | null;
+  intlBankName?: string | null;
+  intlBankAddress?: string | null;
+  intlPaymentReferenceHint?: string | null;
+
+  // brand profile fields
   tagline?: string | null;
   niche?: string | null;
   longDescription?: string | null;
@@ -108,7 +144,6 @@ export class OrganizationsService {
 
   async createOrganization(authUserId: string, input: CreateOrganizationInput) {
     const ownerId = await this.resolveDbUserId(authUserId);
-
     if (!ownerId) throw new BadRequestException('ownerId is required');
 
     const owner = await this.prisma.user.findUnique({
@@ -151,17 +186,33 @@ export class OrganizationsService {
           targetAudience: input.targetAudience ?? null,
           brandStyle: input.brandStyle ?? null,
 
-          // ✅ payment details
-          legalName: input.legalName ?? null,
-          beneficiaryName: input.beneficiaryName ?? null,
-          legalAddress: input.legalAddress ?? null,
-          vatId: input.vatId ?? null,
-          registrationNumber: input.registrationNumber ?? null,
-          iban: input.iban ?? null,
-          swiftBic: input.swiftBic ?? null,
-          bankName: input.bankName ?? null,
-          bankAddress: input.bankAddress ?? null,
-          paymentReferenceHint: input.paymentReferenceHint ?? null,
+          // =========================
+          // ✅ UA payment details
+          // =========================
+          uaCompanyName: input.uaCompanyName ?? null,
+          uaCompanyAddress: input.uaCompanyAddress ?? null,
+          uaEdrpou: input.uaEdrpou ?? null,
+          uaIpn: input.uaIpn ?? null,
+          uaIban: input.uaIban ?? null,
+          uaBankName: input.uaBankName ?? null,
+          uaMfo: input.uaMfo ?? null,
+          uaAccountNumber: input.uaAccountNumber ?? null,
+          uaBeneficiaryName: input.uaBeneficiaryName ?? null,
+          uaPaymentPurposeHint: input.uaPaymentPurposeHint ?? null,
+
+          // =========================
+          // ✅ International payment details
+          // =========================
+          intlLegalName: input.intlLegalName ?? null,
+          intlBeneficiaryName: input.intlBeneficiaryName ?? null,
+          intlLegalAddress: input.intlLegalAddress ?? null,
+          intlVatId: input.intlVatId ?? null,
+          intlRegistrationNumber: input.intlRegistrationNumber ?? null,
+          intlIban: input.intlIban ?? null,
+          intlSwiftBic: input.intlSwiftBic ?? null,
+          intlBankName: input.intlBankName ?? null,
+          intlBankAddress: input.intlBankAddress ?? null,
+          intlPaymentReferenceHint: input.intlPaymentReferenceHint ?? null,
 
           members: {
             create: {
@@ -298,26 +349,58 @@ export class OrganizationsService {
       }),
       ...(input.brandStyle !== undefined && { brandStyle: input.brandStyle }),
 
-      // ✅ payment details
-      ...(input.legalName !== undefined && { legalName: input.legalName }),
-      ...(input.beneficiaryName !== undefined && {
-        beneficiaryName: input.beneficiaryName,
+      // =========================
+      // ✅ UA payment details
+      // =========================
+      ...(input.uaCompanyName !== undefined && {
+        uaCompanyName: input.uaCompanyName,
       }),
-      ...(input.legalAddress !== undefined && {
-        legalAddress: input.legalAddress,
+      ...(input.uaCompanyAddress !== undefined && {
+        uaCompanyAddress: input.uaCompanyAddress,
       }),
-      ...(input.vatId !== undefined && { vatId: input.vatId }),
-      ...(input.registrationNumber !== undefined && {
-        registrationNumber: input.registrationNumber,
+      ...(input.uaEdrpou !== undefined && { uaEdrpou: input.uaEdrpou }),
+      ...(input.uaIpn !== undefined && { uaIpn: input.uaIpn }),
+      ...(input.uaIban !== undefined && { uaIban: input.uaIban }),
+      ...(input.uaBankName !== undefined && { uaBankName: input.uaBankName }),
+      ...(input.uaMfo !== undefined && { uaMfo: input.uaMfo }),
+      ...(input.uaAccountNumber !== undefined && {
+        uaAccountNumber: input.uaAccountNumber,
       }),
-      ...(input.iban !== undefined && { iban: input.iban }),
-      ...(input.swiftBic !== undefined && { swiftBic: input.swiftBic }),
-      ...(input.bankName !== undefined && { bankName: input.bankName }),
-      ...(input.bankAddress !== undefined && {
-        bankAddress: input.bankAddress,
+      ...(input.uaBeneficiaryName !== undefined && {
+        uaBeneficiaryName: input.uaBeneficiaryName,
       }),
-      ...(input.paymentReferenceHint !== undefined && {
-        paymentReferenceHint: input.paymentReferenceHint,
+      ...(input.uaPaymentPurposeHint !== undefined && {
+        uaPaymentPurposeHint: input.uaPaymentPurposeHint,
+      }),
+
+      // =========================
+      // ✅ International payment details
+      // =========================
+      ...(input.intlLegalName !== undefined && {
+        intlLegalName: input.intlLegalName,
+      }),
+      ...(input.intlBeneficiaryName !== undefined && {
+        intlBeneficiaryName: input.intlBeneficiaryName,
+      }),
+      ...(input.intlLegalAddress !== undefined && {
+        intlLegalAddress: input.intlLegalAddress,
+      }),
+      ...(input.intlVatId !== undefined && { intlVatId: input.intlVatId }),
+      ...(input.intlRegistrationNumber !== undefined && {
+        intlRegistrationNumber: input.intlRegistrationNumber,
+      }),
+      ...(input.intlIban !== undefined && { intlIban: input.intlIban }),
+      ...(input.intlSwiftBic !== undefined && {
+        intlSwiftBic: input.intlSwiftBic,
+      }),
+      ...(input.intlBankName !== undefined && {
+        intlBankName: input.intlBankName,
+      }),
+      ...(input.intlBankAddress !== undefined && {
+        intlBankAddress: input.intlBankAddress,
+      }),
+      ...(input.intlPaymentReferenceHint !== undefined && {
+        intlPaymentReferenceHint: input.intlPaymentReferenceHint,
       }),
     };
 

@@ -154,27 +154,38 @@ export class ActPdfService {
     });
   }
 
+  // ✅ Supplier lines (UA) for Act: береться з ua* полів
   private buildOrgLines(org: any): string[] {
     const lines: string[] = [];
-    const name = org?.legalName || org?.name || '—';
-    lines.push(name);
 
-    // address-ish
-    const addr = org?.legalAddress || '';
+    const beneficiary =
+      (org?.uaBeneficiaryName ?? '').trim() ||
+      (org?.uaCompanyName ?? '').trim() ||
+      (org?.name ?? '').trim() ||
+      '—';
+
+    lines.push(beneficiary);
+
+    // якщо beneficiary != company name — покажемо і назву компанії окремо
+    const companyName = (org?.uaCompanyName ?? '').trim();
+    if (companyName && companyName !== beneficiary) {
+      lines.push(`Назва: ${companyName}`);
+    }
+
+    const addr = (org?.uaCompanyAddress ?? '').trim();
     const cityCountry = [org?.city, org?.country].filter(Boolean).join(', ');
     const addrLine = [addr, cityCountry].filter(Boolean).join(', ');
     if (addrLine) lines.push(addrLine);
 
-    if (org?.registrationNumber)
-      lines.push(`ЄДРПОУ: ${org.registrationNumber}`);
-    if (org?.vatId) lines.push(`ІПН / VAT: ${org.vatId}`);
+    if ((org?.uaEdrpou ?? '').trim()) lines.push(`ЄДРПОУ: ${org.uaEdrpou}`);
+    if ((org?.uaIpn ?? '').trim()) lines.push(`ІПН: ${org.uaIpn}`);
 
     if (org?.primaryContactEmail)
       lines.push(`Email: ${org.primaryContactEmail}`);
     if (org?.primaryContactPhone) lines.push(`Тел: ${org.primaryContactPhone}`);
     if (org?.websiteUrl) lines.push(org.websiteUrl);
 
-    return lines;
+    return lines.length ? lines : ['—'];
   }
 
   private buildClientLines(client: any): string[] {
@@ -202,7 +213,6 @@ export class ActPdfService {
 
     const lines: string[] = [];
     lines.push(`Акт №: ${act.number ?? '—'}`);
-    // якщо у тебе є act.date — підстав, якщо ні, буде createdAt
     const actDate = act?.date
       ? this.formatDateISO(act.date)
       : this.formatDateISO(act.createdAt);
@@ -218,19 +228,64 @@ export class ActPdfService {
     const subtotal = invoice?.subtotal ?? null;
     const taxAmount = invoice?.taxAmount ?? 0;
     const total = invoice?.total ?? null;
-
-    // якщо у тебе act.total існує і може відрізнятись — беремо його як істину
     return { subtotal, taxAmount, total };
   }
 
   private acceptanceTextUA(act: any) {
-    // коротко й по суті, як зазвичай в актах
     const title = (act?.title || '').trim();
     return [
       'Сторони підтверджують, що Послуги/Роботи надані (виконані) належним чином, у повному обсязі, у встановлені терміни.',
       'Замовник претензій щодо обсягу, якості та термінів надання Послуг/Робіт не має.',
       title ? `Предмет: ${title}` : null,
     ].filter(Boolean) as string[];
+  }
+
+  // ✅ NEW: UA payment lines for Act PDF (тільки UA, згідно твоєї схеми)
+  private buildUaPaymentLines(org: any, act: any): string[] {
+    const beneficiary =
+      (org?.uaBeneficiaryName ?? '').trim() ||
+      (org?.uaCompanyName ?? '').trim() ||
+      (org?.name ?? '').trim() ||
+      '—';
+
+    const iban = this.formatIban(org?.uaIban);
+    const bankName = (org?.uaBankName ?? '').trim();
+    const mfo = (org?.uaMfo ?? '').trim();
+    const accountNumber = (org?.uaAccountNumber ?? '').trim();
+
+    const purpose = (
+      (org?.uaPaymentPurposeHint ?? '').trim() ||
+      `Оплата за актом № ${act?.number ?? ''}`
+    ).trim();
+
+    const lines: string[] = [];
+    lines.push(`Отримувач: ${beneficiary}`);
+
+    const companyName = (org?.uaCompanyName ?? '').trim();
+    if (companyName && companyName !== beneficiary) {
+      lines.push(`Назва: ${companyName}`);
+    }
+
+    const addr = (org?.uaCompanyAddress ?? '').trim();
+    if (addr) lines.push(`Адреса: ${addr}`);
+
+    const edrpou = (org?.uaEdrpou ?? '').trim();
+    if (edrpou) lines.push(`ЄДРПОУ: ${edrpou}`);
+
+    const ipn = (org?.uaIpn ?? '').trim();
+    if (ipn) lines.push(`ІПН: ${ipn}`);
+
+    lines.push(''); // spacer
+
+    if (iban) lines.push(`IBAN: ${iban}`);
+    if (accountNumber) lines.push(`Рахунок (не-IBAN): ${accountNumber}`);
+    if (bankName) lines.push(`Банк: ${bankName}`);
+    if (mfo) lines.push(`МФО: ${mfo}`);
+
+    lines.push('');
+    lines.push(`Призначення: ${purpose}`);
+
+    return lines;
   }
 
   private async buildPdfBuffer(act: any): Promise<Buffer> {
@@ -250,7 +305,7 @@ export class ActPdfService {
       const org = act.organization ?? {};
       const client = act.client ?? null;
 
-      // ===== Header line (clean) =====
+      // ===== Header =====
       doc.font('BodyBold').fontSize(12);
       doc.text('АКТ НАДАНИХ ПОСЛУГ', left, top, { align: 'left' });
 
@@ -334,7 +389,7 @@ export class ActPdfService {
         doc.y += boxH + 10;
       }
 
-      // ===== Items table (from related invoice items) =====
+      // ===== Items table =====
       const invoice = act.relatedInvoice ?? null;
       const items: any[] = invoice?.items ?? [];
 
@@ -409,7 +464,7 @@ export class ActPdfService {
         });
       };
 
-      const maxTableBottom = doc.page.height - doc.page.margins.bottom - 180;
+      const maxTableBottom = doc.page.height - doc.page.margins.bottom - 220;
 
       if (items.length) {
         this.ensureSpace(doc, headerH + rowH * 3);
@@ -498,7 +553,7 @@ export class ActPdfService {
           idx += 1;
         }
 
-        // ===== Totals (Subtotal / VAT / Total) =====
+        // ===== Totals =====
         const totalsH = 22;
 
         const totalsFromInv = this.calcTotalsFromInvoice(invoice);
@@ -515,7 +570,6 @@ export class ActPdfService {
           { label: 'Загальна сума за актом:', value: totalVal, bold: true },
         ];
 
-        // ensure space for totals rows
         if (
           tableY + totalsH * totals.length + 20 >
           doc.page.height - doc.page.margins.bottom
@@ -555,7 +609,6 @@ export class ActPdfService {
 
         doc.y = tableY + 14;
       } else {
-        // якщо items нема — просто підсумок, але красиво
         this.ensureSpace(doc, 70);
         const boxH = 54;
         const totalVal =
@@ -566,7 +619,7 @@ export class ActPdfService {
         doc.y += boxH + 10;
       }
 
-      // ===== Acceptance block =====
+      // ===== Acceptance =====
       this.ensureSpace(doc, 140);
       const accH = 92;
       this.drawLabelValueBlock(
@@ -580,6 +633,20 @@ export class ActPdfService {
       );
       doc.y += accH + 14;
 
+      // ✅ NEW: Payment details (UA)
+      this.ensureSpace(doc, 170);
+      const payH = 135;
+      this.drawLabelValueBlock(
+        doc,
+        left,
+        doc.y,
+        usableW,
+        payH,
+        'Реквізити для оплати',
+        this.buildUaPaymentLines(org, act),
+      );
+      doc.y += payH + 14;
+
       // ===== Signatures =====
       this.ensureSpace(doc, 120);
 
@@ -591,11 +658,9 @@ export class ActPdfService {
       const sxL = left;
       const sxR = left + signColW + colGap2;
 
-      // outer boxes
       this.strokeRect(doc, sxL, signTop, signColW, signBoxH);
       this.strokeRect(doc, sxR, signTop, signColW, signBoxH);
 
-      // headers
       this.drawCell(doc, sxL, signTop, signColW, 18, 'Виконавець', {
         bold: true,
         valign: 'middle',
@@ -605,7 +670,6 @@ export class ActPdfService {
         valign: 'middle',
       });
 
-      // divider line under headers
       doc
         .moveTo(sxL, signTop + 18)
         .lineTo(sxL + signColW, signTop + 18)
@@ -615,7 +679,6 @@ export class ActPdfService {
         .lineTo(sxR + signColW, signTop + 18)
         .stroke();
 
-      // signature lines
       const lineY = signTop + 52;
       doc
         .moveTo(sxL + 10, lineY)
@@ -630,7 +693,6 @@ export class ActPdfService {
       doc.text('Підпис / П.І.Б.', sxL + 10, lineY + 6);
       doc.text('Підпис / П.І.Б.', sxR + 10, lineY + 6);
 
-      // optional signer names
       const supplierSigner =
         org?.signatoryName ||
         act?.createdBy?.fullName ||
