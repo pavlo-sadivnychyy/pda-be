@@ -243,6 +243,7 @@ model Subscription {
   user   User   @relation(fields: [userId], references: [id])
 
   planId PlanId @default(FREE)
+  pendingPlanId        PlanId?
 
   status             String   @default("active")
   currentPeriodStart DateTime?
