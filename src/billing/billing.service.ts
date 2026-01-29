@@ -143,8 +143,9 @@ export class BillingService {
       where: { userId: user.id },
       data: {
         status: 'pending',
-        planId,
+        pendingPlanId: planId,
         paddleTransactionId: transactionId,
+        paddleStatus: 'created',
       },
     });
 
@@ -168,26 +169,50 @@ export class BillingService {
     });
     if (!user) throw new NotFoundException('User not found');
 
+    // гарантуємо subscription
+    const sub = await this.prisma.subscription.upsert({
+      where: { userId: user.id },
+      create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
+      update: {},
+    });
+
     const txn = await this.fetchTransaction(transactionId);
     const paddleStatus = String(txn?.status ?? '').toLowerCase();
 
     const priceId: string | null =
       txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
 
-    const planId = this.priceIdToPlan(priceId);
+    const planFromTxn = this.priceIdToPlan(priceId);
 
+    // Paddle Billing: draft/ready/paid/completed/past_due/billed/canceled
     const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
 
-    // always store what we know
-    await this.prisma.subscription.update({
-      where: { userId: user.id },
-      data: {
-        paddleStatus,
-        paddleTransactionId: transactionId,
-        ...(planId ? { planId } : {}),
-        ...(isPaid ? { status: 'active', cancelAtPeriodEnd: false } : {}),
-      },
-    });
+    if (isPaid) {
+      const finalPlan = planFromTxn ?? sub.pendingPlanId ?? sub.planId;
+
+      await this.prisma.subscription.update({
+        where: { userId: user.id },
+        data: {
+          status: 'active',
+          planId: finalPlan, // ✅ застосовуємо план тільки тепер
+          pendingPlanId: null, // ✅ чистимо pending
+          cancelAtPeriodEnd: false,
+          paddleStatus,
+          paddleTransactionId: transactionId,
+        },
+      });
+    } else {
+      // ✅ ключ: якщо юзер закрив/не оплатив — не лишаємо pending
+      await this.prisma.subscription.update({
+        where: { userId: user.id },
+        data: {
+          status: 'active',
+          pendingPlanId: null, // ✅ прибираємо “запитаний” план
+          paddleStatus,
+          paddleTransactionId: transactionId, // можеш лишити для історії
+        },
+      });
+    }
 
     const updated = await this.prisma.user.findUnique({
       where: { id: user.id },
@@ -261,7 +286,7 @@ export class BillingService {
         paddleTransactionId: transactionId,
         ...(planId ? { planId } : {}),
         ...(shouldActivate
-          ? { status: 'active', cancelAtPeriodEnd: false }
+          ? { status: 'active', pendingPlanId: null, cancelAtPeriodEnd: false }
           : {}),
       },
     });
