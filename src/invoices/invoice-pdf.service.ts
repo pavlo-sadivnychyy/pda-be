@@ -489,7 +489,7 @@ export class InvoicePdfService {
           align: 'center',
           valign: 'middle',
         });
-        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Тариф', {
+        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Ціна', {
           bold: true,
           align: 'center',
           valign: 'middle',
@@ -884,7 +884,7 @@ export class InvoicePdfService {
           align: 'center',
           valign: 'middle',
         });
-        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Rate', {
+        this.drawCell(doc, colX.rate, yy, cols.rate, headerH, 'Price', {
           bold: true,
           align: 'center',
           valign: 'middle',
