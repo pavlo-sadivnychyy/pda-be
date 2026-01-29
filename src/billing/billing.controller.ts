@@ -27,7 +27,6 @@ export class BillingController {
     });
   }
 
-  // front calls it after success (return page or direct after overlay success)
   @Post('sync-transaction')
   @UseGuards(ClerkAuthGuard)
   async syncTransaction(
@@ -43,7 +42,6 @@ export class BillingController {
   // Paddle webhook
   @Post('webhook')
   async webhook(@Body() body: any, @Headers() headers: any) {
-    // signature verify can be added later; first make it work reliably
     return this.billing.handleWebhook(body, headers);
   }
 }

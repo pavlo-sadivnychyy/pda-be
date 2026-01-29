@@ -23,7 +23,7 @@ export class BillingService {
   private paddle: AxiosInstance;
 
   constructor(private readonly prisma: PrismaService) {
-    const env = (process.env.PADDLE_ENV ?? 'sandbox').toLowerCase(); // "sandbox" | "production"
+    const env = (process.env.PADDLE_ENV ?? 'sandbox').toLowerCase();
     const baseURL =
       env === 'production'
         ? 'https://api.paddle.com'
@@ -73,25 +73,23 @@ export class BillingService {
     }
   }
 
+  // ===============================
+  // CREATE CHECKOUT
+  // ===============================
   async createCheckout(input: CreateCheckoutInput) {
     const { authUserId, planId } = input;
 
     if (!authUserId) throw new BadRequestException('authUserId missing');
     if (!planId) throw new BadRequestException('planId missing');
-    if (planId === PlanId.FREE) {
+    if (planId === PlanId.FREE)
       throw new BadRequestException('FREE does not require checkout');
-    }
 
     this.requireEnv('PADDLE_API_KEY');
+    const frontendUrl = this.requireEnv('APP_PUBLIC_URL');
 
     const priceId = this.getPriceId(planId);
-    if (!priceId) {
-      throw new InternalServerErrorException(
-        `PriceId is not configured for plan ${planId}. Set PADDLE_PRICE_BASIC_ID / PADDLE_PRICE_PRO_ID`,
-      );
-    }
-
-    const frontendUrl = this.requireEnv('APP_PUBLIC_URL'); // https://dev.spravly.com
+    if (!priceId)
+      throw new InternalServerErrorException('PriceId not configured');
 
     const user = await this.prisma.user.findUnique({
       where: { authUserId },
@@ -99,7 +97,7 @@ export class BillingService {
     });
     if (!user) throw new NotFoundException('User not found');
 
-    // ensure subscription row exists
+    // ensure subscription exists
     await this.prisma.subscription.upsert({
       where: { userId: user.id },
       create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
@@ -114,49 +112,42 @@ export class BillingService {
         customer: { email: user.email },
         custom_data: {
           userId: user.id,
-          planId,
         },
         checkout: {
           settings: {
             display_mode: 'wide-overlay',
-            // return page AFTER payment (front will sync + redirect to pricing)
-            success_url: `${frontendUrl}/checkout?transaction_id={transaction_id}&result=success`,
+            success_url: `${frontendUrl}/checkout?result=success`,
             cancel_url: `${frontendUrl}/pricing?checkout=cancel`,
           },
         },
       });
 
       transactionId = res?.data?.data?.id;
-      if (!transactionId)
-        throw new Error('Paddle did not return transaction id');
+      if (!transactionId) throw new Error('No transaction id');
     } catch (e: any) {
       throw new InternalServerErrorException(
-        e?.response?.data?.error?.message ??
-          e?.response?.data?.message ??
+        e?.response?.data?.message ??
           e?.message ??
           'Failed to create Paddle transaction',
       );
     }
 
-    // mark pending locally (so UI can show "processing")
+    // ✅ СТАВИМО pending, але PLAN НЕ ЧІПАЄМО
     await this.prisma.subscription.update({
       where: { userId: user.id },
       data: {
         status: 'pending',
-        pendingPlanId: planId,
         paddleTransactionId: transactionId,
         paddleStatus: 'created',
       },
     });
 
-    // IMPORTANT: no redirect url to your /checkout for “payment”
-    return {
-      transactionId,
-      successUrl: `${frontendUrl}/checkout?transaction_id=${transactionId}&result=success`,
-      cancelUrl: `${frontendUrl}/pricing?checkout=cancel`,
-    };
+    return { transactionId };
   }
 
+  // ===============================
+  // SYNC TRANSACTION
+  // ===============================
   async syncTransactionToDb(input: SyncTxnInput) {
     const { authUserId, transactionId } = input;
 
@@ -167,129 +158,86 @@ export class BillingService {
       where: { authUserId },
       include: { subscription: true },
     });
-    if (!user) throw new NotFoundException('User not found');
+    if (!user || !user.subscription)
+      throw new NotFoundException('Subscription not found');
 
-    // гарантуємо subscription
-    const sub = await this.prisma.subscription.upsert({
-      where: { userId: user.id },
-      create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
-      update: {},
-    });
+    const sub = user.subscription;
 
     const txn = await this.fetchTransaction(transactionId);
     const paddleStatus = String(txn?.status ?? '').toLowerCase();
 
-    const priceId: string | null =
+    const priceId =
       txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
 
     const planFromTxn = this.priceIdToPlan(priceId);
 
-    // Paddle Billing: draft/ready/paid/completed/past_due/billed/canceled
     const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
 
     if (isPaid) {
-      const finalPlan = planFromTxn ?? sub.pendingPlanId ?? sub.planId;
-
+      // ✅ ТІЛЬКИ ПІСЛЯ ОПЛАТИ міняємо план
       await this.prisma.subscription.update({
         where: { userId: user.id },
         data: {
           status: 'active',
-          planId: finalPlan, // ✅ застосовуємо план тільки тепер
-          pendingPlanId: null, // ✅ чистимо pending
+          planId: planFromTxn ?? sub.planId,
           cancelAtPeriodEnd: false,
           paddleStatus,
           paddleTransactionId: transactionId,
         },
       });
     } else {
-      // ✅ ключ: якщо юзер закрив/не оплатив — не лишаємо pending
+      // ✅ Якщо закрив або не оплатив — просто прибираємо pending
       await this.prisma.subscription.update({
         where: { userId: user.id },
         data: {
           status: 'active',
-          pendingPlanId: null, // ✅ прибираємо “запитаний” план
           paddleStatus,
-          paddleTransactionId: transactionId, // можеш лишити для історії
+          paddleTransactionId: transactionId,
         },
       });
     }
 
-    const updated = await this.prisma.user.findUnique({
-      where: { id: user.id },
-      include: { subscription: true },
-    });
-
-    return { ok: true, user: updated };
+    return { ok: true };
   }
 
-  // webhook handler (robust)
+  // ===============================
+  // WEBHOOK
+  // ===============================
   async handleWebhook(body: any, _headers: any) {
-    const eventType = body?.event_type ?? body?.eventType ?? body?.type ?? null;
     const data = body?.data ?? body;
-
-    const transactionId: string | null =
+    const transactionId =
       data?.transaction_id ?? data?.id ?? data?.transaction?.id ?? null;
 
-    // If it’s a transaction event, it usually includes transaction id.
-    // If not — we just ACK to avoid retries storm.
-    if (!transactionId) {
-      return { ok: true, ignored: true, reason: 'No transactionId', eventType };
-    }
+    if (!transactionId) return { ok: true, ignored: true };
 
-    // find subscription by transactionId first
+    const txn = await this.fetchTransaction(transactionId);
+    const paddleStatus = String(txn?.status ?? '').toLowerCase();
+
+    const priceId =
+      txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
+
+    const planFromTxn = this.priceIdToPlan(priceId);
+
+    const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
+
+    // знаходимо підписку по transactionId
     const sub = await this.prisma.subscription.findFirst({
       where: { paddleTransactionId: transactionId },
     });
 
-    // If not found — try resolve via transaction custom_data.userId
-    let userId: string | null = sub?.userId ?? null;
+    if (!sub) return { ok: true };
 
-    if (!userId) {
-      const txn = await this.fetchTransaction(transactionId);
-      userId = txn?.custom_data?.userId ?? txn?.custom_data?.user_id ?? null;
-
-      if (!userId) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: 'No matching subscription / no custom_data.userId',
-          eventType,
-        };
-      }
+    if (isPaid) {
+      await this.prisma.subscription.update({
+        where: { userId: sub.userId },
+        data: {
+          status: 'active',
+          planId: planFromTxn ?? sub.planId,
+          cancelAtPeriodEnd: false,
+          paddleStatus,
+        },
+      });
     }
-
-    const txn = await this.fetchTransaction(transactionId);
-
-    const paddleStatus = String(txn?.status ?? '').toLowerCase();
-    const priceId: string | null =
-      txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
-    const planId = this.priceIdToPlan(priceId);
-
-    const shouldActivate =
-      eventType === 'transaction.paid' ||
-      eventType === 'transaction.completed' ||
-      paddleStatus === 'paid' ||
-      paddleStatus === 'completed';
-
-    await this.prisma.subscription.upsert({
-      where: { userId },
-      create: {
-        userId,
-        planId: planId ?? PlanId.FREE,
-        status: shouldActivate ? 'active' : 'pending',
-        paddleStatus,
-        paddleTransactionId: transactionId,
-        cancelAtPeriodEnd: false,
-      },
-      update: {
-        paddleStatus,
-        paddleTransactionId: transactionId,
-        ...(planId ? { planId } : {}),
-        ...(shouldActivate
-          ? { status: 'active', pendingPlanId: null, cancelAtPeriodEnd: false }
-          : {}),
-      },
-    });
 
     return { ok: true };
   }
