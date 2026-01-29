@@ -484,7 +484,7 @@ export class InvoicePdfService {
           bold: true,
           valign: 'middle',
         });
-        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Годин', {
+        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Кількість', {
           bold: true,
           align: 'center',
           valign: 'middle',
@@ -879,7 +879,7 @@ export class InvoicePdfService {
           bold: true,
           valign: 'middle',
         });
-        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Hours', {
+        this.drawCell(doc, colX.qty, yy, cols.qty, headerH, 'Amount', {
           bold: true,
           align: 'center',
           valign: 'middle',
