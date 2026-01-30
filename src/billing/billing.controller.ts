@@ -39,7 +39,16 @@ export class BillingController {
     });
   }
 
-  // Paddle webhook
+  // ✅ cancel auto-renew (work until period end)
+  @Post('cancel')
+  @UseGuards(ClerkAuthGuard)
+  async cancel(@Req() req: any) {
+    return this.billing.cancelAtPeriodEnd({
+      authUserId: req.authUserId,
+    });
+  }
+
+  // Paddle webhook (ONLY ONE webhook route in app)
   @Post('webhook')
   async webhook(@Body() body: any, @Headers() headers: any) {
     return this.billing.handleWebhook(body, headers);

@@ -18,6 +18,10 @@ type SyncTxnInput = {
   transactionId: string;
 };
 
+type CancelInput = {
+  authUserId: string;
+};
+
 @Injectable()
 export class BillingService {
   private paddle: AxiosInstance;
@@ -73,6 +77,19 @@ export class BillingService {
     }
   }
 
+  private async fetchSubscription(subscriptionId: string) {
+    try {
+      const res = await this.paddle.get(`/subscriptions/${subscriptionId}`);
+      return res?.data?.data;
+    } catch (e: any) {
+      throw new InternalServerErrorException(
+        e?.response?.data?.message ??
+          e?.message ??
+          'Failed to fetch subscription',
+      );
+    }
+  }
+
   // ===============================
   // CREATE CHECKOUT
   // ===============================
@@ -97,7 +114,6 @@ export class BillingService {
     });
     if (!user) throw new NotFoundException('User not found');
 
-    // ensure subscription exists
     await this.prisma.subscription.upsert({
       where: { userId: user.id },
       create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
@@ -132,7 +148,6 @@ export class BillingService {
       );
     }
 
-    // ✅ СТАВИМО pending, але PLAN НЕ ЧІПАЄМО
     await this.prisma.subscription.update({
       where: { userId: user.id },
       data: {
@@ -173,8 +188,10 @@ export class BillingService {
 
     const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
 
+    const paddleSubscriptionId =
+      txn?.subscription_id ?? txn?.subscription?.id ?? null;
+
     if (isPaid) {
-      // ✅ ТІЛЬКИ ПІСЛЯ ОПЛАТИ міняємо план
       await this.prisma.subscription.update({
         where: { userId: user.id },
         data: {
@@ -183,10 +200,12 @@ export class BillingService {
           cancelAtPeriodEnd: false,
           paddleStatus,
           paddleTransactionId: transactionId,
+          paddleSubscriptionId:
+            paddleSubscriptionId ?? sub.paddleSubscriptionId,
+          paddlePriceId: priceId ?? sub.paddlePriceId,
         },
       });
     } else {
-      // ✅ Якщо закрив або не оплатив — просто прибираємо pending
       await this.prisma.subscription.update({
         where: { userId: user.id },
         data: {
@@ -201,44 +220,202 @@ export class BillingService {
   }
 
   // ===============================
+  // CANCEL AT PERIOD END
+  // ===============================
+  async cancelAtPeriodEnd(input: CancelInput) {
+    const { authUserId } = input;
+    if (!authUserId) throw new BadRequestException('authUserId missing');
+
+    this.requireEnv('PADDLE_API_KEY');
+
+    const user = await this.prisma.user.findUnique({
+      where: { authUserId },
+      include: { subscription: true },
+    });
+    if (!user || !user.subscription)
+      throw new NotFoundException('Subscription not found');
+
+    const sub = user.subscription;
+
+    if (!sub.paddleSubscriptionId) {
+      throw new BadRequestException('paddleSubscriptionId is missing');
+    }
+
+    // already scheduled
+    if (sub.cancelAtPeriodEnd) {
+      return {
+        ok: true,
+        cancelAtPeriodEnd: true,
+        currentPeriodEnd: sub.currentPeriodEnd,
+      };
+    }
+
+    let paddleSub: any;
+    try {
+      const res = await this.paddle.post(
+        `/subscriptions/${sub.paddleSubscriptionId}/cancel`,
+        { effective_from: 'next_billing_period' },
+      );
+      paddleSub = res?.data?.data;
+    } catch (e: any) {
+      throw new InternalServerErrorException(
+        e?.response?.data?.message ??
+          e?.message ??
+          'Failed to cancel subscription in Paddle',
+      );
+    }
+
+    const period =
+      paddleSub?.current_billing_period ??
+      paddleSub?.billing_period ??
+      paddleSub?.billing_cycle ??
+      null;
+
+    const currentPeriodStart = period?.starts_at
+      ? new Date(period.starts_at)
+      : null;
+
+    const currentPeriodEnd = period?.ends_at ? new Date(period.ends_at) : null;
+
+    await this.prisma.subscription.update({
+      where: { userId: user.id },
+      data: {
+        cancelAtPeriodEnd: true,
+        status: 'active',
+        paddleStatus:
+          String(paddleSub?.status ?? sub.paddleStatus ?? '').toLowerCase() ||
+          sub.paddleStatus,
+        ...(currentPeriodStart ? { currentPeriodStart } : {}),
+        ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+      },
+    });
+
+    return {
+      ok: true,
+      cancelAtPeriodEnd: true,
+      currentPeriodEnd,
+    };
+  }
+
+  // ===============================
   // WEBHOOK
   // ===============================
   async handleWebhook(body: any, _headers: any) {
+    const eventType = body?.event_type ?? body?.eventType ?? body?.type ?? null;
     const data = body?.data ?? body;
-    const transactionId =
+
+    const subscriptionId: string | null =
+      data?.subscription_id ?? data?.subscription?.id ?? null;
+
+    const transactionId: string | null =
       data?.transaction_id ?? data?.id ?? data?.transaction?.id ?? null;
 
-    if (!transactionId) return { ok: true, ignored: true };
+    const userId: string | null =
+      data?.custom_data?.userId ?? data?.custom_data?.user_id ?? null;
 
-    const txn = await this.fetchTransaction(transactionId);
-    const paddleStatus = String(txn?.status ?? '').toLowerCase();
+    const dbSub =
+      (userId
+        ? await this.prisma.subscription.findUnique({ where: { userId } })
+        : null) ??
+      (subscriptionId
+        ? await this.prisma.subscription.findFirst({
+            where: { paddleSubscriptionId: subscriptionId },
+          })
+        : null) ??
+      (transactionId
+        ? await this.prisma.subscription.findFirst({
+            where: { paddleTransactionId: transactionId },
+          })
+        : null);
 
-    const priceId =
-      txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
+    if (!dbSub) return { ok: true, ignored: true };
 
-    const planFromTxn = this.priceIdToPlan(priceId);
+    // subscription events: keep period end updated + keep cancelAtPeriodEnd in sync
+    if (subscriptionId) {
+      const paddleSub = await this.fetchSubscription(subscriptionId);
+      const paddleStatus = String(paddleSub?.status ?? '').toLowerCase();
 
-    const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
+      const priceId: string | null =
+        paddleSub?.items?.[0]?.price?.id ??
+        paddleSub?.items?.[0]?.price_id ??
+        null;
 
-    // знаходимо підписку по transactionId
-    const sub = await this.prisma.subscription.findFirst({
-      where: { paddleTransactionId: transactionId },
-    });
+      const planFromPaddle = this.priceIdToPlan(priceId);
 
-    if (!sub) return { ok: true };
+      const period =
+        paddleSub?.current_billing_period ??
+        paddleSub?.billing_period ??
+        paddleSub?.billing_cycle ??
+        null;
 
-    if (isPaid) {
+      const currentPeriodStart = period?.starts_at
+        ? new Date(period.starts_at)
+        : null;
+
+      const currentPeriodEnd = period?.ends_at
+        ? new Date(period.ends_at)
+        : null;
+
+      const scheduled = paddleSub?.scheduled_change ?? null;
+      const cancelAtPeriodEnd =
+        Boolean(scheduled) &&
+        (String(scheduled?.action ?? '').toLowerCase() === 'cancel' ||
+          String(scheduled?.type ?? '').toLowerCase() === 'cancel');
+
+      const isCanceled =
+        paddleStatus === 'canceled' || eventType === 'subscription.canceled';
+
       await this.prisma.subscription.update({
-        where: { userId: sub.userId },
+        where: { userId: dbSub.userId },
         data: {
-          status: 'active',
-          planId: planFromTxn ?? sub.planId,
-          cancelAtPeriodEnd: false,
+          paddleSubscriptionId: subscriptionId,
           paddleStatus,
+          paddlePriceId: priceId ?? dbSub.paddlePriceId,
+          ...(planFromPaddle ? { planId: planFromPaddle } : {}),
+          ...(currentPeriodStart ? { currentPeriodStart } : {}),
+          ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+          cancelAtPeriodEnd: isCanceled ? false : cancelAtPeriodEnd,
+          status: 'active',
         },
       });
+
+      return { ok: true };
     }
 
-    return { ok: true };
+    // transaction events: activate on paid
+    if (transactionId) {
+      const txn = await this.fetchTransaction(transactionId);
+      const paddleStatus = String(txn?.status ?? '').toLowerCase();
+
+      const priceId =
+        txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
+
+      const planFromTxn = this.priceIdToPlan(priceId);
+
+      const isPaid = paddleStatus === 'paid' || paddleStatus === 'completed';
+
+      const paddleSubscriptionIdFromTxn =
+        txn?.subscription_id ?? txn?.subscription?.id ?? null;
+
+      if (isPaid) {
+        await this.prisma.subscription.update({
+          where: { userId: dbSub.userId },
+          data: {
+            status: 'active',
+            planId: planFromTxn ?? dbSub.planId,
+            cancelAtPeriodEnd: false,
+            paddleStatus,
+            paddleTransactionId: transactionId,
+            paddleSubscriptionId:
+              paddleSubscriptionIdFromTxn ?? dbSub.paddleSubscriptionId,
+            paddlePriceId: priceId ?? dbSub.paddlePriceId,
+          },
+        });
+      }
+
+      return { ok: true };
+    }
+
+    return { ok: true, ignored: true };
   }
 }
