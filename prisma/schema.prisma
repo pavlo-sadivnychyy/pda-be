@@ -409,6 +409,8 @@ model ChatSession {
   title  String
   status ChatSessionStatus @default(ACTIVE)
 
+  allowKnowledgeBase Boolean @default(true)
+
   messages ChatMessage[]
 
   createdAt DateTime @default(now())

@@ -16,10 +16,17 @@ import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 class CreateSessionDto {
   organizationId: string;
   title?: string;
+
+  // ✅ NEW: user controls docs access for this session
+  allowKnowledgeBase?: boolean;
 }
 
 class SendMessageDto {
   content: string;
+}
+
+class SetKnowledgeAccessDto {
+  allowKnowledgeBase: boolean;
 }
 
 @UseGuards(ClerkAuthGuard)
@@ -61,6 +68,27 @@ export class ChatController {
       organizationId: dto.organizationId,
       authUserId: req.authUserId,
       title: dto.title,
+      allowKnowledgeBase: dto.allowKnowledgeBase, // ✅ NEW
+    });
+
+    return { session };
+  }
+
+  // ✅ NEW: toggle docs access for a session
+  @Post('sessions/:id/knowledge-access')
+  async setKnowledgeAccess(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: SetKnowledgeAccessDto,
+  ) {
+    if (typeof dto.allowKnowledgeBase !== 'boolean') {
+      throw new BadRequestException('allowKnowledgeBase must be boolean');
+    }
+
+    const session = await this.chat.setSessionKnowledgeAccess({
+      sessionId: id,
+      authUserId: req.authUserId,
+      allowKnowledgeBase: dto.allowKnowledgeBase,
     });
 
     return { session };
