@@ -381,7 +381,6 @@ export class InvoicesService {
     const greeting = invoice.client.contactName || invoice.client.name || '';
 
     const title = isUa ? 'Рахунок-фактура' : 'Invoice';
-    const viewLabel = isUa ? 'Переглянути інвойс' : 'View invoice';
     const pdfName = isUa
       ? `invoice-ua-${invoice.number}.pdf`
       : `invoice-int-${invoice.number}.pdf`;
@@ -399,10 +398,6 @@ export class InvoicesService {
         <p style="margin-top:16px;">
           ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
         </p>
-
-        <a href="${invoiceUrl}" style="display:inline-block;padding:10px 14px;background:#111827;color:white;border-radius:999px;text-decoration:none;">
-          ${viewLabel}
-        </a>
 
         <p style="margin-top:16px;font-size:12px;color:#6b7280;">
           Sent from ${orgName}

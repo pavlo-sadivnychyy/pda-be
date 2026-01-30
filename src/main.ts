@@ -1,10 +1,10 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import * as process from 'node:process';
-import * as bodyParser from 'body-parser';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // ✅ required for webhook signature verification (raw body)
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   const allowedOrigins = [
     'http://localhost:3001',
@@ -22,18 +22,13 @@ async function bootstrap() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Paddle-Signature',
+      'paddle-signature',
+    ],
   });
-
-  app.use(
-    bodyParser.json({
-      verify: (req: any, _res, buf: Buffer) => {
-        if (req.originalUrl === '/billing/monobank/webhook') {
-          req.rawBody = buf;
-        }
-      },
-    }),
-  );
 
   await app.listen(process.env.PORT || 3000);
 }

@@ -15,6 +15,7 @@ import { QuotesModule } from './quotes/quotes.module';
 import { ActivityModule } from './activity/activity.module';
 import { BillingModule } from './billing/billing.module';
 import { ServicesModule } from './services/services.module';
+import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { ServicesModule } from './services/services.module';
     BillingModule,
     ServicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
   ],
   controllers: [AppController],
   providers: [AppService],

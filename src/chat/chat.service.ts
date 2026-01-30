@@ -59,6 +59,7 @@ export class ChatService {
     organizationId: string;
     authUserId: string;
     title?: string;
+    allowKnowledgeBase?: boolean; // ✅ NEW
   }) {
     const { organizationId, authUserId, title } = params;
 
@@ -71,7 +72,30 @@ export class ChatService {
         createdById,
         title: title || 'Новий діалог',
         status: ChatSessionStatus.ACTIVE,
+        allowKnowledgeBase: params.allowKnowledgeBase ?? true,
       },
+    });
+  }
+
+  async setSessionKnowledgeAccess(params: {
+    sessionId: string;
+    authUserId: string;
+    allowKnowledgeBase: boolean;
+  }) {
+    const userId = await this.plan.resolveDbUserId(params.authUserId);
+
+    const session = await this.prisma.chatSession.findUnique({
+      where: { id: params.sessionId },
+      select: { id: true, organizationId: true },
+    });
+
+    if (!session) throw new NotFoundException('Chat session not found');
+
+    await this.plan.assertOrgAccess(userId, session.organizationId);
+
+    return this.prisma.chatSession.update({
+      where: { id: session.id },
+      data: { allowKnowledgeBase: Boolean(params.allowKnowledgeBase) },
     });
   }
 
@@ -110,6 +134,11 @@ export class ChatService {
 
     const session = await this.prisma.chatSession.findUnique({
       where: { id: sessionId },
+      select: {
+        id: true,
+        organizationId: true,
+        allowKnowledgeBase: true,
+      },
     });
 
     if (!session) throw new NotFoundException('Chat session not found');
@@ -152,21 +181,28 @@ export class ChatService {
       ? this.buildBusinessContext(businessProfile, organization)
       : '';
 
-    const kbChunks = await this.findRelevantChunks({
-      organizationId: session.organizationId,
-      query: content,
-      limit: 8,
-    });
+    // ✅ RAG only if allowed by session
+    let knowledgeSnippets: { content: string; source: string }[] = [];
 
-    const knowledgeSnippets = kbChunks.map((chunk) => ({
-      content: chunk.content,
-      source: `${chunk.document.title} (#${chunk.chunkIndex + 1})`,
-    }));
+    if (session.allowKnowledgeBase) {
+      const kbChunks = await this.findRelevantChunks({
+        organizationId: session.organizationId,
+        query: content,
+        limit: 8,
+      });
+
+      knowledgeSnippets = kbChunks.map((chunk) => ({
+        content: chunk.content,
+        source: `${chunk.document.title} (#${chunk.chunkIndex + 1})`,
+      }));
+    }
 
     const assistantText = await this.ai.generateBusinessReply({
+      ctx: { userId, organizationId: session.organizationId },
       businessContext,
       knowledgeSnippets,
       messages: aiMessages,
+      allowDocuments: session.allowKnowledgeBase,
     });
 
     const assistantMessage = await this.prisma.chatMessage.create({
@@ -174,7 +210,10 @@ export class ChatService {
         sessionId: session.id,
         role: ChatMessageRole.ASSISTANT,
         content: assistantText,
-        metadata: { knowledgeSources: knowledgeSnippets },
+        metadata: {
+          knowledgeSources: knowledgeSnippets,
+          allowKnowledgeBase: session.allowKnowledgeBase,
+        },
       },
     });
 
