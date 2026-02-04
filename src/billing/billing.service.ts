@@ -183,10 +183,10 @@ export class BillingService {
     rawBody: Buffer | undefined,
     headers: any,
   ) {
-    const secret = process.env.PADDLE_WEBHOOK_SECRET_KEY;
+    const secret = process.env.PADDLE_WEBHOOK_SECRET;
     if (!secret) {
       throw new InternalServerErrorException(
-        'PADDLE_WEBHOOK_SECRET_KEY is not set',
+        'PADDLE_WEBHOOK_SECRET is not set',
       );
     }
 
