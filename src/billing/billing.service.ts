@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -32,6 +33,7 @@ type WebhookInput = {
 
 @Injectable()
 export class BillingService {
+  private readonly logger = new Logger(BillingService.name);
   private paddle: AxiosInstance;
 
   constructor(private readonly prisma: PrismaService) {
@@ -86,17 +88,11 @@ export class BillingService {
     return s === 'paid' || s === 'completed' || s === 'success';
   }
 
-  private isBadSubscriptionOrPaymentStatus(status: string | null | undefined) {
+  private isBadSubscriptionStatus(status: string | null | undefined) {
     const s = this.toLower(status);
+    // ✅ НЕ включаємо past_due — Paddle робить кілька спроб
     return (
-      s === 'past_due' ||
-      s === 'past-due' ||
-      s === 'paused' ||
-      s === 'canceled' ||
-      s === 'cancelled' ||
-      s === 'unpaid' ||
-      s === 'failed' ||
-      s === 'expired'
+      s === 'canceled' || s === 'cancelled' || s === 'expired' || s === 'unpaid'
     );
   }
 
@@ -134,6 +130,9 @@ export class BillingService {
       const res = await this.paddle.get(`/transactions/${transactionId}`);
       return res?.data?.data;
     } catch (e: any) {
+      this.logger.error(
+        `Failed to fetch transaction ${transactionId}: ${e?.message}`,
+      );
       throw new InternalServerErrorException(
         e?.response?.data?.message ??
           e?.message ??
@@ -147,6 +146,9 @@ export class BillingService {
       const res = await this.paddle.get(`/subscriptions/${subscriptionId}`);
       return res?.data?.data;
     } catch (e: any) {
+      this.logger.error(
+        `Failed to fetch subscription ${subscriptionId}: ${e?.message}`,
+      );
       throw new InternalServerErrorException(
         e?.response?.data?.message ??
           e?.message ??
@@ -157,9 +159,6 @@ export class BillingService {
 
   // ---------------------------
   // Paddle webhook verification (manual, HMAC SHA256)
-  // Paddle-Signature: ts=...;h1=...
-  // signed_payload = `${ts}:${rawBody}`
-  // hmac_sha256(secret, signed_payload) hex == h1
   // ---------------------------
   private parsePaddleSignatureHeader(headerValue: string) {
     const parts = headerValue.split(';').map((p) => p.trim());
@@ -209,12 +208,11 @@ export class BillingService {
     const { ts, h1s } = this.parsePaddleSignatureHeader(sigHeader);
     if (!ts || !h1s.length) throw new UnauthorizedException('Bad signature');
 
-    // replay protection: 5 minutes tolerance (не 5 секунд, щоб не ловити кривий час на хостингу)
     const tsNum = Number(ts);
     if (!Number.isFinite(tsNum)) throw new UnauthorizedException('Bad ts');
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const toleranceSec = 5 * 60;
+    const toleranceSec = 5 * 60; // 5 minutes
     if (Math.abs(nowSec - tsNum) > toleranceSec) {
       throw new UnauthorizedException('Webhook timestamp out of tolerance');
     }
@@ -230,7 +228,6 @@ export class BillingService {
 
     const digestBuf = Buffer.from(digest, 'utf8');
 
-    // може бути кілька h1 при ротації секретів — приймаємо будь-який з них :contentReference[oaicite:4]{index=4}
     const ok = h1s.some((h1) => {
       const h1Buf = Buffer.from(h1, 'utf8');
       if (h1Buf.length !== digestBuf.length) return false;
@@ -239,7 +236,6 @@ export class BillingService {
 
     if (!ok) throw new UnauthorizedException('Invalid webhook signature');
 
-    // eventKey fallback for idempotency (якщо немає event_id)
     const eventKeyFallback = `ts=${ts};h1=${h1s[0]}`;
     return { eventKeyFallback };
   }
@@ -251,10 +247,8 @@ export class BillingService {
       });
       return true;
     } catch (e: any) {
-      // unique violation => already processed
       const msg = String(e?.message ?? '');
       if (msg.toLowerCase().includes('unique')) return false;
-      // prisma P2002
       if (e?.code === 'P2002') return false;
       throw e;
     }
@@ -284,6 +278,7 @@ export class BillingService {
     });
     if (!user) throw new NotFoundException('User not found');
 
+    // ✅ Ensure subscription record exists
     await this.prisma.subscription.upsert({
       where: { userId: user.id },
       create: { userId: user.id, planId: PlanId.FREE, status: 'active' },
@@ -308,7 +303,12 @@ export class BillingService {
 
       transactionId = res?.data?.data?.id;
       if (!transactionId) throw new Error('No transaction id');
+
+      this.logger.log(
+        `Created checkout for user ${user.id}, txn: ${transactionId}`,
+      );
     } catch (e: any) {
+      this.logger.error(`Checkout creation failed: ${e?.message}`);
       throw new InternalServerErrorException(
         e?.response?.data?.message ??
           e?.message ??
@@ -359,6 +359,8 @@ export class BillingService {
     const paddleSubscriptionId =
       txn?.subscription_id ?? txn?.subscription?.id ?? null;
 
+    const customerId = txn?.customer_id ?? txn?.customer?.id ?? null;
+
     if (isPaid) {
       const targetPlan = sub.pendingPlanId ?? planFromTxn ?? sub.planId;
 
@@ -384,13 +386,15 @@ export class BillingService {
           paddleTransactionId: transactionId,
           paddleSubscriptionId: subId ?? sub.paddleSubscriptionId,
           paddlePriceId: priceId ?? sub.paddlePriceId,
+          paddleCustomerId: customerId ?? sub.paddleCustomerId,
           ...(periodStart ? { currentPeriodStart: periodStart } : {}),
           ...(periodEnd ? { currentPeriodEnd: periodEnd } : {}),
         },
       });
+
+      this.logger.log(`User ${user.id} upgraded to ${targetPlan}`);
     } else {
-      // НЕ даунгрейдимо тут на FREE: це може бути "закрив checkout" або разова невдача.
-      // downgrade робить cron тільки після periodEnd.
+      // ✅ Not paid - just update status, don't downgrade
       await this.prisma.subscription.update({
         where: { userId: user.id },
         data: {
@@ -400,14 +404,15 @@ export class BillingService {
           paddleTransactionId: transactionId,
         },
       });
+
+      this.logger.warn(
+        `Transaction ${transactionId} not paid, status: ${txnStatus}`,
+      );
     }
 
     return { ok: true };
   }
 
-  // ===============================
-  // CANCEL AT PERIOD END
-  // ===============================
   // ===============================
   // CANCEL AT PERIOD END
   // ===============================
@@ -426,8 +431,11 @@ export class BillingService {
 
     const sub = user.subscription;
 
-    // already scheduled
+    // ✅ Already scheduled for cancellation
     if (sub.cancelAtPeriodEnd) {
+      this.logger.log(
+        `Subscription already scheduled for cancellation: ${sub.userId}`,
+      );
       return {
         ok: true,
         cancelAtPeriodEnd: true,
@@ -435,12 +443,19 @@ export class BillingService {
       };
     }
 
-    // ✅ SELF-HEAL: якщо paddleSubscriptionId missing — пробуємо відновити
+    // ✅ User is on FREE plan - nothing to cancel
+    if (sub.planId === PlanId.FREE) {
+      throw new BadRequestException('Cannot cancel FREE plan');
+    }
+
+    // ✅ SELF-HEAL: recover paddleSubscriptionId if missing
     let paddleSubscriptionId = sub.paddleSubscriptionId ?? null;
 
     if (!paddleSubscriptionId) {
-      // 1) якщо є paddleTransactionId — витягуємо subscription id з транзакції
       if (sub.paddleTransactionId) {
+        this.logger.log(
+          `Recovering paddleSubscriptionId from transaction ${sub.paddleTransactionId}`,
+        );
         const txn = await this.fetchTransaction(sub.paddleTransactionId);
 
         paddleSubscriptionId =
@@ -465,14 +480,13 @@ export class BillingService {
       }
     }
 
-    // якщо все ще немає — значить підписки реально нема
     if (!paddleSubscriptionId) {
       throw new BadRequestException(
-        'paddleSubscriptionId is missing (no active Paddle subscription found for this user)',
+        'paddleSubscriptionId is missing (no active Paddle subscription found)',
       );
     }
 
-    // ✅ cancel in Paddle
+    // ✅ Cancel in Paddle
     let paddleSub: any;
     try {
       const res = await this.paddle.post(
@@ -480,7 +494,14 @@ export class BillingService {
         { effective_from: 'next_billing_period' },
       );
       paddleSub = res?.data?.data;
+
+      this.logger.log(
+        `Cancelled Paddle subscription ${paddleSubscriptionId} for user ${user.id}`,
+      );
     } catch (e: any) {
+      this.logger.error(
+        `Failed to cancel Paddle subscription: ${e?.response?.data?.message ?? e?.message}`,
+      );
       throw new InternalServerErrorException(
         e?.response?.data?.message ??
           e?.message ??
@@ -488,17 +509,8 @@ export class BillingService {
       );
     }
 
-    const period =
-      paddleSub?.current_billing_period ??
-      paddleSub?.billing_period ??
-      paddleSub?.billing_cycle ??
-      null;
-
-    const currentPeriodStart = period?.starts_at
-      ? new Date(period.starts_at)
-      : null;
-
-    const currentPeriodEnd = period?.ends_at ? new Date(period.ends_at) : null;
+    const { currentPeriodStart, currentPeriodEnd } =
+      this.extractPeriod(paddleSub);
 
     await this.prisma.subscription.update({
       where: { userId: user.id },
@@ -527,13 +539,13 @@ export class BillingService {
   async handleWebhook(input: WebhookInput) {
     const { body, headers, rawBody } = input;
 
-    // 1) verify signature (throws 401 on fail) :contentReference[oaicite:5]{index=5}
+    // 1) Verify signature
     const { eventKeyFallback } = this.verifyPaddleWebhookOrThrow(
       rawBody,
       headers,
     );
 
-    // 2) build eventKey for idempotency
+    // 2) Build eventKey for idempotency
     const eventId =
       body?.event_id ?? body?.id ?? body?.eventId ?? body?.event?.id ?? null;
     const eventKey = eventId
@@ -542,13 +554,15 @@ export class BillingService {
 
     const isFirstTime = await this.markWebhookProcessedOrThrow(eventKey);
     if (!isFirstTime) {
-      // already processed -> OK (idempotent)
+      this.logger.log(`Webhook already processed: ${eventKey}`);
       return { ok: true, deduped: true };
     }
 
     const eventType = this.toLower(
       body?.event_type ?? body?.eventType ?? body?.type,
     );
+
+    this.logger.log(`Processing webhook: ${eventType} (${eventKey})`);
 
     const data = body?.data ?? body;
 
@@ -571,6 +585,7 @@ export class BillingService {
       data?.custom_data?.userID ??
       null;
 
+    // Find subscription in DB
     const dbSub =
       (userId
         ? await this.prisma.subscription.findUnique({ where: { userId } })
@@ -586,9 +601,16 @@ export class BillingService {
           })
         : null);
 
-    if (!dbSub) return { ok: true, ignored: true, eventType };
+    if (!dbSub) {
+      this.logger.warn(
+        `No subscription found for webhook ${eventType}, ignoring`,
+      );
+      return { ok: true, ignored: true, eventType };
+    }
 
-    // A) subscription is canonical -> always sync period + status + cancelAtPeriodEnd
+    // ===============================
+    // ✅ HANDLE SUBSCRIPTION EVENTS
+    // ===============================
     if (subscriptionId) {
       const paddleSub = await this.fetchSubscription(subscriptionId);
       const paddleStatus = this.toLower(paddleSub?.status);
@@ -605,12 +627,88 @@ export class BillingService {
       const cancelAtPeriodEnd =
         this.inferCancelAtPeriodEndFromPaddle(paddleSub);
 
+      const customerId =
+        paddleSub?.customer_id ?? paddleSub?.customer?.id ?? null;
+
+      // ✅ Special handling for subscription.updated (renewal)
+      if (eventType === 'subscription.updated') {
+        this.logger.log(
+          `Subscription updated for user ${dbSub.userId}, status: ${paddleStatus}`,
+        );
+
+        // If subscription is active again (after renewal), reset cancelAtPeriodEnd
+        if (paddleStatus === 'active' && dbSub.cancelAtPeriodEnd) {
+          this.logger.log(
+            `Subscription renewed after cancellation for user ${dbSub.userId}`,
+          );
+        }
+
+        await this.prisma.subscription.update({
+          where: { userId: dbSub.userId },
+          data: {
+            paddleSubscriptionId: subscriptionId,
+            paddleStatus,
+            paddlePriceId: priceId ?? dbSub.paddlePriceId,
+            paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
+            ...(planFromPaddle ? { planId: planFromPaddle } : {}),
+            ...(currentPeriodStart ? { currentPeriodStart } : {}),
+            ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+            cancelAtPeriodEnd,
+            status: 'active',
+          },
+        });
+
+        return { ok: true, eventType };
+      }
+
+      // ✅ Special handling for subscription.canceled
+      if (eventType === 'subscription.canceled') {
+        this.logger.log(`Subscription canceled for user ${dbSub.userId}`);
+
+        await this.prisma.subscription.update({
+          where: { userId: dbSub.userId },
+          data: {
+            paddleSubscriptionId: subscriptionId,
+            paddleStatus: 'canceled',
+            paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
+            cancelAtPeriodEnd: true,
+            ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+          },
+        });
+
+        return { ok: true, eventType };
+      }
+
+      // ✅ Special handling for subscription.activated (first payment success)
+      if (eventType === 'subscription.activated') {
+        this.logger.log(`Subscription activated for user ${dbSub.userId}`);
+
+        await this.prisma.subscription.update({
+          where: { userId: dbSub.userId },
+          data: {
+            paddleSubscriptionId: subscriptionId,
+            paddleStatus: 'active',
+            paddlePriceId: priceId ?? dbSub.paddlePriceId,
+            paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
+            ...(planFromPaddle ? { planId: planFromPaddle } : {}),
+            ...(currentPeriodStart ? { currentPeriodStart } : {}),
+            ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+            cancelAtPeriodEnd: false,
+            status: 'active',
+          },
+        });
+
+        return { ok: true, eventType };
+      }
+
+      // ✅ Generic subscription sync (fallback)
       await this.prisma.subscription.update({
         where: { userId: dbSub.userId },
         data: {
           paddleSubscriptionId: subscriptionId,
           paddleStatus,
           paddlePriceId: priceId ?? dbSub.paddlePriceId,
+          paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
           ...(planFromPaddle ? { planId: planFromPaddle } : {}),
           ...(currentPeriodStart ? { currentPeriodStart } : {}),
           ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
@@ -619,10 +717,12 @@ export class BillingService {
         },
       });
 
-      return { ok: true };
+      return { ok: true, eventType };
     }
 
-    // B) transaction: on paid -> activate plan + sync period via subscription fetch
+    // ===============================
+    // ✅ HANDLE TRANSACTION EVENTS
+    // ===============================
     if (transactionId) {
       const txn = await this.fetchTransaction(transactionId);
       const txnStatus = this.toLower(txn?.status);
@@ -635,6 +735,8 @@ export class BillingService {
 
       const paddleSubscriptionIdFromTxn =
         txn?.subscription_id ?? txn?.subscription?.id ?? null;
+
+      const customerId = txn?.customer_id ?? txn?.customer?.id ?? null;
 
       if (isPaid) {
         const targetPlan = dbSub.pendingPlanId ?? planFromTxn ?? dbSub.planId;
@@ -662,12 +764,17 @@ export class BillingService {
             paddleTransactionId: transactionId,
             paddleSubscriptionId: subId ?? dbSub.paddleSubscriptionId,
             paddlePriceId: priceId ?? dbSub.paddlePriceId,
+            paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
             ...(periodStart ? { currentPeriodStart: periodStart } : {}),
             ...(periodEnd ? { currentPeriodEnd: periodEnd } : {}),
           },
         });
+
+        this.logger.log(
+          `Transaction ${transactionId} paid, user ${dbSub.userId} upgraded to ${targetPlan}`,
+        );
       } else {
-        // not paid => just record status + clear pending; no downgrade here
+        // ✅ Not paid - update status but don't downgrade
         await this.prisma.subscription.update({
           where: { userId: dbSub.userId },
           data: {
@@ -675,11 +782,16 @@ export class BillingService {
             pendingPlanId: null,
             paddleStatus: txnStatus,
             paddleTransactionId: transactionId,
+            paddleCustomerId: customerId ?? dbSub.paddleCustomerId,
           },
         });
+
+        this.logger.warn(
+          `Transaction ${transactionId} not paid, status: ${txnStatus}`,
+        );
       }
 
-      return { ok: true };
+      return { ok: true, eventType };
     }
 
     return { ok: true, ignored: true, eventType };
