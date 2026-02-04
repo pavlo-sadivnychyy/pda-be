@@ -39,7 +39,6 @@ export class BillingController {
     });
   }
 
-  // ✅ cancel auto-renew (work until period end)
   @Post('cancel')
   @UseGuards(ClerkAuthGuard)
   async cancel(@Req() req: any) {
@@ -50,7 +49,14 @@ export class BillingController {
 
   // Paddle webhook (ONLY ONE webhook route in app)
   @Post('webhook')
-  async webhook(@Body() body: any, @Headers() headers: any) {
-    return this.billing.handleWebhook(body, headers);
+  async webhook(@Req() req: any, @Body() body: any, @Headers() headers: any) {
+    // rawBody доступний коли в main.ts rawBody:true
+    const rawBody: Buffer | undefined = req?.rawBody;
+
+    return this.billing.handleWebhook({
+      body,
+      headers,
+      rawBody,
+    });
   }
 }

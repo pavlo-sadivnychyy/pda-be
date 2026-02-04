@@ -277,6 +277,13 @@ model Subscription {
   updatedAt DateTime @updatedAt
 }
 
+model ProcessedWebhookEvent {
+  id        String   @id @default(cuid())
+  provider  String   // 'paddle'
+  eventKey  String   @unique // event_id або fallback key
+  createdAt DateTime @default(now())
+}
+
 
 // ---- Documents ----
 
