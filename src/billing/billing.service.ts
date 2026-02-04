@@ -408,6 +408,9 @@ export class BillingService {
   // ===============================
   // CANCEL AT PERIOD END
   // ===============================
+  // ===============================
+  // CANCEL AT PERIOD END
+  // ===============================
   async cancelAtPeriodEnd(input: CancelInput) {
     const { authUserId } = input;
     if (!authUserId) throw new BadRequestException('authUserId missing');
@@ -423,10 +426,7 @@ export class BillingService {
 
     const sub = user.subscription;
 
-    if (!sub.paddleSubscriptionId) {
-      throw new BadRequestException('paddleSubscriptionId is missing');
-    }
-
+    // already scheduled
     if (sub.cancelAtPeriodEnd) {
       return {
         ok: true,
@@ -435,10 +435,48 @@ export class BillingService {
       };
     }
 
+    // ✅ SELF-HEAL: якщо paddleSubscriptionId missing — пробуємо відновити
+    let paddleSubscriptionId = sub.paddleSubscriptionId ?? null;
+
+    if (!paddleSubscriptionId) {
+      // 1) якщо є paddleTransactionId — витягуємо subscription id з транзакції
+      if (sub.paddleTransactionId) {
+        const txn = await this.fetchTransaction(sub.paddleTransactionId);
+
+        paddleSubscriptionId =
+          txn?.subscription_id ?? txn?.subscription?.id ?? null;
+
+        const priceId =
+          txn?.items?.[0]?.price?.id ?? txn?.items?.[0]?.price_id ?? null;
+
+        const customerId = txn?.customer_id ?? txn?.customer?.id ?? null;
+
+        await this.prisma.subscription.update({
+          where: { userId: sub.userId },
+          data: {
+            paddleSubscriptionId: paddleSubscriptionId ?? undefined,
+            paddlePriceId: priceId ?? undefined,
+            paddleCustomerId: customerId ?? undefined,
+            paddleStatus:
+              String(txn?.status ?? sub.paddleStatus ?? '').toLowerCase() ||
+              sub.paddleStatus,
+          },
+        });
+      }
+    }
+
+    // якщо все ще немає — значить підписки реально нема
+    if (!paddleSubscriptionId) {
+      throw new BadRequestException(
+        'paddleSubscriptionId is missing (no active Paddle subscription found for this user)',
+      );
+    }
+
+    // ✅ cancel in Paddle
     let paddleSub: any;
     try {
       const res = await this.paddle.post(
-        `/subscriptions/${sub.paddleSubscriptionId}/cancel`,
+        `/subscriptions/${paddleSubscriptionId}/cancel`,
         { effective_from: 'next_billing_period' },
       );
       paddleSub = res?.data?.data;
@@ -450,21 +488,37 @@ export class BillingService {
       );
     }
 
-    const { currentPeriodStart, currentPeriodEnd } =
-      this.extractPeriod(paddleSub);
+    const period =
+      paddleSub?.current_billing_period ??
+      paddleSub?.billing_period ??
+      paddleSub?.billing_cycle ??
+      null;
+
+    const currentPeriodStart = period?.starts_at
+      ? new Date(period.starts_at)
+      : null;
+
+    const currentPeriodEnd = period?.ends_at ? new Date(period.ends_at) : null;
 
     await this.prisma.subscription.update({
       where: { userId: user.id },
       data: {
+        paddleSubscriptionId,
         cancelAtPeriodEnd: true,
         status: 'active',
-        paddleStatus: this.toLower(paddleSub?.status ?? sub.paddleStatus),
+        paddleStatus:
+          String(paddleSub?.status ?? sub.paddleStatus ?? '').toLowerCase() ||
+          sub.paddleStatus,
         ...(currentPeriodStart ? { currentPeriodStart } : {}),
         ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
       },
     });
 
-    return { ok: true, cancelAtPeriodEnd: true, currentPeriodEnd };
+    return {
+      ok: true,
+      cancelAtPeriodEnd: true,
+      currentPeriodEnd,
+    };
   }
 
   // ===============================
