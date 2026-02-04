@@ -1,21 +1,10 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import * as process from 'node:process';
-import { ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
   // ✅ required for webhook signature verification (raw body)
-  const app = await NestFactory.create(AppModule, {
-    rawBody: true,
-  });
-
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-    }),
-  );
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   const allowedOrigins = [
     'http://localhost:3001',
@@ -38,16 +27,10 @@ async function bootstrap() {
       'Authorization',
       'Paddle-Signature',
       'paddle-signature',
-      'X-Requested-With',
     ],
-    exposedHeaders: ['Content-Range', 'X-Content-Range'],
-    maxAge: 3600, // Cache preflight requests for 1 hour
   });
 
   await app.listen(process.env.PORT || 3000);
 }
 
-bootstrap().catch((error) => {
-  console.error('❌ Failed to start application:', error);
-  process.exit(1);
-});
+bootstrap().catch((error) => console.log(error));
