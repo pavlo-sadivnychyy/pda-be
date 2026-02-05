@@ -335,7 +335,7 @@ export class ChatService {
         .filter(
           (item): item is { chunk: (typeof chunks)[0]; score: number } =>
             item !== null && item.score > -0.5,
-        ) // ✅ FIX: Type guard
+        )
         .sort((a, b) => b.score - a.score) // ✅ FIX: тепер TypeScript знає що не null
         .slice(0, limit);
 
