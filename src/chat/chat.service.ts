@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
 import {
   ChatMessageRole,
   ChatSessionStatus,
@@ -59,7 +63,7 @@ export class ChatService {
     organizationId: string;
     authUserId: string;
     title?: string;
-    allowKnowledgeBase?: boolean; // ✅ NEW
+    allowKnowledgeBase?: boolean;
   }) {
     const { organizationId, authUserId, title } = params;
 
@@ -130,99 +134,128 @@ export class ChatService {
   }) {
     const { sessionId, authUserId, content } = params;
 
-    const userId = await this.plan.resolveDbUserId(authUserId);
+    try {
+      const userId = await this.plan.resolveDbUserId(authUserId);
 
-    const session = await this.prisma.chatSession.findUnique({
-      where: { id: sessionId },
-      select: {
-        id: true,
-        organizationId: true,
-        allowKnowledgeBase: true,
-      },
-    });
-
-    if (!session) throw new NotFoundException('Chat session not found');
-
-    await this.plan.assertOrgAccess(userId, session.organizationId);
-
-    // ✅ AI quota by plan (FREE 5/mo, BASIC 50/mo, PRO ∞)
-    await this.plan.assertAiQuota(userId, session.organizationId);
-
-    const userMessage = await this.prisma.chatMessage.create({
-      data: {
-        sessionId: session.id,
-        role: ChatMessageRole.USER,
-        content,
-      },
-    });
-
-    const history = await this.prisma.chatMessage.findMany({
-      where: { sessionId: session.id },
-      orderBy: { createdAt: 'asc' },
-      take: 20,
-    });
-
-    const aiMessages = history.map((m) => ({
-      role:
-        m.role === ChatMessageRole.USER
-          ? ('user' as const)
-          : ('assistant' as const),
-      content: m.content,
-    }));
-
-    const businessProfile = await this.prisma.businessProfile.findUnique({
-      where: { organizationId: session.organizationId },
-    });
-    const organization = await this.prisma.organization.findUnique({
-      where: { id: session.organizationId },
-    });
-
-    const businessContext = businessProfile
-      ? this.buildBusinessContext(businessProfile, organization)
-      : '';
-
-    // ✅ RAG only if allowed by session
-    let knowledgeSnippets: { content: string; source: string }[] = [];
-
-    if (session.allowKnowledgeBase) {
-      const kbChunks = await this.findRelevantChunks({
-        organizationId: session.organizationId,
-        query: content,
-        limit: 8,
+      const session = await this.prisma.chatSession.findUnique({
+        where: { id: sessionId },
+        select: {
+          id: true,
+          organizationId: true,
+          allowKnowledgeBase: true,
+        },
       });
 
-      knowledgeSnippets = kbChunks.map((chunk) => ({
-        content: chunk.content,
-        source: `${chunk.document.title} (#${chunk.chunkIndex + 1})`,
-      }));
-    }
+      if (!session) throw new NotFoundException('Chat session not found');
 
-    const assistantText = await this.ai.generateBusinessReply({
-      ctx: { userId, organizationId: session.organizationId },
-      businessContext,
-      knowledgeSnippets,
-      messages: aiMessages,
-      allowDocuments: session.allowKnowledgeBase,
-    });
+      await this.plan.assertOrgAccess(userId, session.organizationId);
 
-    const assistantMessage = await this.prisma.chatMessage.create({
-      data: {
-        sessionId: session.id,
-        role: ChatMessageRole.ASSISTANT,
-        content: assistantText,
-        metadata: {
-          knowledgeSources: knowledgeSnippets,
-          allowKnowledgeBase: session.allowKnowledgeBase,
+      // ✅ AI quota by plan (FREE 5/mo, BASIC 50/mo, PRO ∞)
+      await this.plan.assertAiQuota(userId, session.organizationId);
+
+      // Створюємо повідомлення користувача
+      const userMessage = await this.prisma.chatMessage.create({
+        data: {
+          sessionId: session.id,
+          role: ChatMessageRole.USER,
+          content,
         },
-      },
-    });
+      });
 
-    await this.prisma.chatSession.update({
-      where: { id: session.id },
-      data: { updatedAt: new Date() },
-    });
+      // Отримуємо історію
+      const history = await this.prisma.chatMessage.findMany({
+        where: { sessionId: session.id },
+        orderBy: { createdAt: 'asc' },
+        take: 20,
+      });
 
-    return { userMessage, assistantMessage, knowledgeSnippets };
+      const aiMessages = history.map((m) => ({
+        role:
+          m.role === ChatMessageRole.USER
+            ? ('user' as const)
+            : ('assistant' as const),
+        content: m.content || '', // ✅ FIX: fallback для null
+      }));
+
+      // ✅ FIX: Паралельне завантаження даних
+      const [businessProfile, organization] = await Promise.all([
+        this.prisma.businessProfile.findUnique({
+          where: { organizationId: session.organizationId },
+        }),
+        this.prisma.organization.findUnique({
+          where: { id: session.organizationId },
+        }),
+      ]);
+
+      const businessContext = this.buildBusinessContext(
+        businessProfile,
+        organization,
+      );
+
+      // RAG - only if allowed by session
+      let knowledgeSnippets: { content: string; source: string }[] = [];
+
+      if (session.allowKnowledgeBase) {
+        try {
+          const kbChunks = await this.findRelevantChunks({
+            organizationId: session.organizationId,
+            query: content,
+            limit: 8,
+          });
+
+          knowledgeSnippets = kbChunks.map((chunk) => ({
+            content: chunk.content || '', // ✅ FIX: fallback
+            source: `${chunk.document?.title || 'Unknown'} (#${chunk.chunkIndex + 1})`,
+          }));
+        } catch (error) {
+          console.error('RAG error:', error);
+          // ✅ FIX: продовжуємо без RAG якщо помилка
+        }
+      }
+
+      // ✅ FIX: AI виклик з обробкою помилок
+      let assistantText: string;
+      try {
+        assistantText = await this.ai.generateBusinessReply({
+          ctx: { userId, organizationId: session.organizationId },
+          businessContext,
+          knowledgeSnippets,
+          messages: aiMessages,
+          allowDocuments: session.allowKnowledgeBase,
+        });
+      } catch (error) {
+        console.error('AI generation error:', error);
+        throw new BadRequestException('Failed to generate AI response');
+      }
+
+      // ✅ FIX: Перевірка на порожню відповідь
+      if (!assistantText || !assistantText.trim()) {
+        assistantText = 'Вибачте, не вдалося згенерувати відповідь.';
+      }
+
+      const assistantMessage = await this.prisma.chatMessage.create({
+        data: {
+          sessionId: session.id,
+          role: ChatMessageRole.ASSISTANT,
+          content: assistantText,
+          metadata: {
+            knowledgeSources: knowledgeSnippets,
+            allowKnowledgeBase: session.allowKnowledgeBase,
+          },
+        },
+      });
+
+      await this.prisma.chatSession.update({
+        where: { id: session.id },
+        data: { updatedAt: new Date() },
+      });
+
+      return { userMessage, assistantMessage, knowledgeSnippets };
+    } catch (error) {
+      // ✅ FIX: Логування для діагностики
+      console.error('Chat sendMessage error:', error);
+      throw error;
+    }
   }
 
   // --------- HELPERS ---------
@@ -270,10 +303,61 @@ export class ChatService {
   }) {
     const { organizationId, query, limit } = params;
 
-    const queryEmbedding = await this.ai.embedQuery(query);
+    try {
+      const queryEmbedding = await this.ai.embedQuery(query);
 
-    if (!queryEmbedding) {
-      return this.prisma.documentChunk.findMany({
+      // ✅ FIX: Якщо embedQuery фейлиться
+      if (!queryEmbedding || !Array.isArray(queryEmbedding)) {
+        return this.fallbackSearch(organizationId, query, limit);
+      }
+
+      const chunks = await this.prisma.documentChunk.findMany({
+        where: { document: { organizationId, status: 'READY' as any } },
+        include: { document: true },
+        take: 1000,
+      });
+
+      if (!chunks.length) {
+        return [];
+      }
+
+      // ✅ FIX: Type-safe scoring
+      const scored = chunks
+        .map((chunk) => {
+          // ✅ FIX: Перевірка на валідність embedding
+          const emb = chunk.embedding as unknown as number[];
+          if (!Array.isArray(emb) || emb.length === 0) {
+            return null;
+          }
+          const score = this.cosineSimilarity(queryEmbedding, emb);
+          return { chunk, score };
+        })
+        .filter(
+          (item): item is { chunk: (typeof chunks)[0]; score: number } =>
+            item !== null && item.score > -0.5,
+        ) // ✅ FIX: Type guard
+        .sort((a, b) => b.score - a.score) // ✅ FIX: тепер TypeScript знає що не null
+        .slice(0, limit);
+
+      if (!scored.length) {
+        return this.fallbackSearch(organizationId, query, limit);
+      }
+
+      return scored.map((s) => s.chunk); // ✅ FIX: тепер TypeScript знає що не null
+    } catch (error) {
+      console.error('findRelevantChunks error:', error);
+      return this.fallbackSearch(organizationId, query, limit);
+    }
+  }
+
+  // ✅ NEW: Helper для fallback пошуку
+  private async fallbackSearch(
+    organizationId: string,
+    query: string,
+    limit: number,
+  ) {
+    try {
+      return await this.prisma.documentChunk.findMany({
         where: {
           document: { organizationId, status: 'READY' as any },
           content: { contains: query, mode: 'insensitive' },
@@ -281,51 +365,14 @@ export class ChatService {
         include: { document: true },
         take: limit,
       });
+    } catch (error) {
+      console.error('fallbackSearch error:', error);
+      return [];
     }
-
-    const chunks = await this.prisma.documentChunk.findMany({
-      where: { document: { organizationId, status: 'READY' as any } },
-      include: { document: true },
-      take: 1000,
-    });
-
-    if (!chunks.length) {
-      return this.prisma.documentChunk.findMany({
-        where: {
-          document: { organizationId, status: 'READY' as any },
-          content: { contains: query, mode: 'insensitive' },
-        },
-        include: { document: true },
-        take: limit,
-      });
-    }
-
-    const scored = chunks
-      .map((chunk) => {
-        const emb = chunk.embedding as unknown as number[];
-        const score = this.cosineSimilarity(queryEmbedding, emb);
-        return { chunk, score };
-      })
-      .filter((item) => item.score > -0.5)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
-
-    if (!scored.length) {
-      return this.prisma.documentChunk.findMany({
-        where: {
-          document: { organizationId, status: 'READY' as any },
-          content: { contains: query, mode: 'insensitive' },
-        },
-        include: { document: true },
-        take: limit,
-      });
-    }
-
-    return scored.map((s) => s.chunk);
   }
 
   private cosineSimilarity(a: number[], b: number[]): number {
-    if (!a.length || !b.length || a.length !== b.length) return -1;
+    if (!a || !b || !a.length || !b.length || a.length !== b.length) return -1;
 
     let dot = 0;
     let normA = 0;
