@@ -20,7 +20,6 @@ import { ClerkAuthGuard } from '../auth/clerk-auth.guard';
 export class ClientsController {
   constructor(private readonly clientsService: ClientsService) {}
 
-  // POST /clients
   @Post()
   async create(@Req() req: any, @Body() dto: CreateClientDto) {
     const client = await this.clientsService.create(req.authUserId, dto);
