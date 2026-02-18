@@ -38,6 +38,12 @@ export class PlanService {
     return user.id;
   }
 
+  assertCanUseTaxCalendar(plan: PlanId) {
+    if (plan === PlanId.FREE) {
+      throw new ForbiddenException('Tax calendar is available on BASIC/PRO');
+    }
+  }
+
   // --------------------------
   // Plan
   // --------------------------
