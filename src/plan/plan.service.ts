@@ -57,7 +57,6 @@ export class PlanService {
     if (!organizationId)
       throw new BadRequestException('organizationId is required');
 
-    // if you ever add members later - it starts working automatically
     const membership = await this.prisma.userOrganization.findUnique({
       where: { userId_organizationId: { userId, organizationId } },
       select: { id: true },
@@ -65,7 +64,6 @@ export class PlanService {
 
     if (membership) return;
 
-    // owner-only fallback (your current case)
     const org = await this.prisma.organization.findUnique({
       where: { id: organizationId },
       select: { ownerId: true },
@@ -84,7 +82,7 @@ export class PlanService {
   private clientsLimit(plan: PlanId) {
     if (plan === PlanId.FREE) return 3;
     if (plan === PlanId.BASIC) return 20;
-    return Infinity; // PRO
+    return Infinity;
   }
 
   private documentsLimit(plan: PlanId) {
@@ -93,7 +91,6 @@ export class PlanService {
     return Infinity;
   }
 
-  // FREE: total 3, BASIC: 20/month, PRO: Infinity
   private invoicesLimit(plan: PlanId) {
     if (plan === PlanId.FREE) return { type: 'total' as const, value: 3 };
     if (plan === PlanId.BASIC) return { type: 'month' as const, value: 20 };
@@ -116,9 +113,14 @@ export class PlanService {
   }
 
   assertCanUseInvoiceReminders(plan: PlanId) {
-    // BASIC is blocked too
     if (plan !== PlanId.PRO) {
       throw new ForbiddenException('Invoice reminders are available on PRO');
+    }
+  }
+
+  assertCanUseRecurringInvoices(plan: PlanId) {
+    if (plan !== PlanId.PRO) {
+      throw new ForbiddenException('Recurring invoices are available on PRO');
     }
   }
 
@@ -142,9 +144,7 @@ export class PlanService {
     const limit = this.clientsLimit(plan);
     if (!Number.isFinite(limit)) return;
 
-    const count = await this.prisma.client.count({
-      where: { organizationId },
-    });
+    const count = await this.prisma.client.count({ where: { organizationId } });
 
     if (count >= limit) {
       throw new ForbiddenException(
@@ -199,7 +199,6 @@ export class PlanService {
     }
   }
 
-  // AI quota: count USER messages per org in current month
   async assertAiQuota(userId: string, organizationId: string) {
     const plan = await this.getPlanIdForUser(userId);
     const limit = this.aiLimit(plan);

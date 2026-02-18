@@ -21,10 +21,10 @@ enum OrganizationMemberStatus {
 }
 
 enum ClientCrmStatus {
-  LEAD        // потенційний
+  LEAD // потенційний
   IN_PROGRESS // в роботі
-  ACTIVE      // постійний / активний
-  INACTIVE    // неактивний
+  ACTIVE // постійний / активний
+  INACTIVE // неактивний
 }
 
 enum DocumentSource {
@@ -131,13 +131,14 @@ model User {
   todoTasks      TodoTask[]
   todoDailyPlans TodoDailyPlan[]
 
-  clients              Client[]
-  invoices             Invoice[]
-  acts                 Act[]
-  quotes               Quote[]
-  invoiceRemindersSent InvoiceReminderLog[] @relation("InvoiceReminderToUser")
-  activityLogs         ActivityLog[]
-  services UserService[]
+  clients                  Client[]
+  invoices                 Invoice[]
+  acts                     Act[]
+  quotes                   Quote[]
+  invoiceRemindersSent     InvoiceReminderLog[]      @relation("InvoiceReminderToUser")
+  activityLogs             ActivityLog[]
+  services                 UserService[]
+  recurringInvoiceProfiles RecurringInvoiceProfile[]
 }
 
 // ---- Organization ----
@@ -167,16 +168,16 @@ model Organization {
   // =========================
   // ✅ UA payment details (NEW)
   // =========================
-  uaCompanyName          String? // Назва компанії/ФОП (UA)
-  uaCompanyAddress       String? // Адреса (UA)
-  uaEdrpou               String? // ЄДРПОУ
-  uaIpn                  String? // ІПН (якщо треба)
-  uaIban                 String?
-  uaBankName             String?
-  uaMfo                  String? // МФО (часто треба в UA реквізитах)
-  uaAccountNumber        String? // якщо десь ще використовуєш не-IBAN
-  uaBeneficiaryName      String? // Отримувач (UA)
-  uaPaymentPurposeHint   String? // Призначення платежу (UA)
+  uaCompanyName        String? // Назва компанії/ФОП (UA)
+  uaCompanyAddress     String? // Адреса (UA)
+  uaEdrpou             String? // ЄДРПОУ
+  uaIpn                String? // ІПН (якщо треба)
+  uaIban               String?
+  uaBankName           String?
+  uaMfo                String? // МФО (часто треба в UA реквізитах)
+  uaAccountNumber      String? // якщо десь ще використовуєш не-IBAN
+  uaBeneficiaryName    String? // Отримувач (UA)
+  uaPaymentPurposeHint String? // Призначення платежу (UA)
 
   // ==================================
   // ✅ International payment details
@@ -204,14 +205,14 @@ model Organization {
   documents       Document[]
   chatSessions    ChatSession[]
 
-  clients          Client[]
-  invoices         Invoice[]
-  acts             Act[]
-  quotes           Quote[]
-  invoiceReminders InvoiceReminderLog[] @relation("InvoiceReminderToOrg")
-  activityLogs     ActivityLog[]
+  clients                  Client[]
+  invoices                 Invoice[]
+  acts                     Act[]
+  quotes                   Quote[]
+  invoiceReminders         InvoiceReminderLog[]      @relation("InvoiceReminderToOrg")
+  activityLogs             ActivityLog[]
+  recurringInvoiceProfiles RecurringInvoiceProfile[]
 }
-
 
 // ---- UserOrganization ----
 
@@ -259,19 +260,19 @@ model Subscription {
   userId String @unique
   user   User   @relation(fields: [userId], references: [id])
 
-  planId PlanId @default(FREE)
-  pendingPlanId        PlanId?
+  planId        PlanId  @default(FREE)
+  pendingPlanId PlanId?
 
-  status             String   @default("active")
+  status             String    @default("active")
   currentPeriodStart DateTime?
   currentPeriodEnd   DateTime?
-  cancelAtPeriodEnd  Boolean  @default(false)
+  cancelAtPeriodEnd  Boolean   @default(false)
 
-  paddleCustomerId      String?
-  paddleTransactionId   String? @unique
-  paddleSubscriptionId  String? @unique
-  paddleStatus          String?
-  paddlePriceId         String?
+  paddleCustomerId     String?
+  paddleTransactionId  String? @unique
+  paddleSubscriptionId String? @unique
+  paddleStatus         String?
+  paddlePriceId        String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -279,11 +280,10 @@ model Subscription {
 
 model ProcessedWebhookEvent {
   id        String   @id @default(cuid())
-  provider  String   // 'paddle'
+  provider  String // 'paddle'
   eventKey  String   @unique // event_id або fallback key
   createdAt DateTime @default(now())
 }
-
 
 // ---- Documents ----
 
@@ -461,11 +461,11 @@ model Client {
   organization Organization @relation(fields: [organizationId], references: [id])
   createdBy    User?        @relation(fields: [createdById], references: [id])
 
-  invoices Invoice[]
-  acts     Act[]
-  quotes   Quote[]
+  invoices                 Invoice[]
+  acts                     Act[]
+  quotes                   Quote[]
+  recurringInvoiceProfiles RecurringInvoiceProfile[]
 }
-
 
 // ---- Invoices ----
 
@@ -510,8 +510,16 @@ model Invoice {
   convertedFromQuote Quote?
   reminders          InvoiceReminderLog[] @relation("InvoiceReminderToInvoice")
 
+  recurringProfileId String?
+  recurringProfile   RecurringInvoiceProfile? @relation(fields: [recurringProfileId], references: [id])
+
+  recurringProfilesAsTemplate RecurringInvoiceProfile[] @relation("RecurringTemplateInvoice")
+
+  recurringInvoiceRuns RecurringInvoiceRun[]
+
   @@unique([organizationId, number])
   @@index([organizationId, createdAt])
+  @@index([recurringProfileId])
 }
 
 model InvoiceItem {
@@ -679,20 +687,109 @@ model ActivityLog {
 }
 
 model UserService {
-  id          String   @id @default(cuid())
-  userId      String
+  id     String @id @default(cuid())
+  userId String
 
   name        String
   description String?
-  price       Decimal  @db.Decimal(18, 2)
+  price       Decimal @db.Decimal(18, 2)
 
-  isActive    Boolean  @default(true)
+  isActive Boolean @default(true)
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
 
   @@index([userId, isActive])
   @@index([userId, createdAt])
+}
+
+enum RecurringProfileStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+}
+
+enum RecurringIntervalUnit {
+  DAY
+  WEEK
+  MONTH
+  YEAR
+}
+
+enum RecurringRunStatus {
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+model RecurringInvoiceProfile {
+  id             String  @id @default(cuid())
+  organizationId String
+  clientId       String?
+  createdById    String
+
+  // ✅ existing invoice used as template
+  templateInvoiceId String
+
+  intervalUnit  RecurringIntervalUnit
+  intervalCount Int                   @default(1)
+
+  startAt   DateTime
+  nextRunAt DateTime
+
+  // ✅ dueDate = issueDate + dueDays
+  dueDays Int @default(7)
+
+  // ✅ auto send invoice email (PRO only)
+  autoSendEmail Boolean @default(false)
+
+  // ua | international
+  variant String @default("ua")
+
+  status RecurringProfileStatus @default(ACTIVE)
+
+  lastRunAt     DateTime?
+  lastInvoiceId String?
+  lastError     String?
+
+  // ✅ optimistic concurrency for cron
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  client          Client?      @relation(fields: [clientId], references: [id])
+  createdBy       User         @relation(fields: [createdById], references: [id])
+  templateInvoice Invoice      @relation("RecurringTemplateInvoice", fields: [templateInvoiceId], references: [id])
+
+  // ✅ invoices created by this profile
+  invoices Invoice[]
+
+  runs RecurringInvoiceRun[]
+
+  @@index([organizationId, status, nextRunAt])
+  @@index([templateInvoiceId])
+  @@index([clientId])
+}
+
+model RecurringInvoiceRun {
+  id        String @id @default(cuid())
+  profileId String
+
+  runAt DateTime
+
+  status       RecurringRunStatus
+  invoiceId    String?
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+
+  profile RecurringInvoiceProfile @relation(fields: [profileId], references: [id])
+  invoice Invoice?                @relation(fields: [invoiceId], references: [id])
+
+  @@index([profileId, runAt])
+  @@index([invoiceId])
 }
