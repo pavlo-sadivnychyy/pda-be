@@ -16,6 +16,7 @@ import { ActivityModule } from './activity/activity.module';
 import { BillingModule } from './billing/billing.module';
 import { ServicesModule } from './services/services.module';
 import { ScheduleModule } from '@nestjs/schedule';
+import { RecurringInvoicesModule } from './recurring-invoices/recurring-invoices.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     ActivityModule,
     BillingModule,
     ServicesModule,
+    RecurringInvoicesModule,
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
   ],

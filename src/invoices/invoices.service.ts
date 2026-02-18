@@ -313,143 +313,7 @@ export class InvoicesService {
     variant: 'ua' | 'international' = 'ua',
   ) {
     const dbUserId = await this.plan.resolveDbUserId(authUserId);
-
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id },
-      include: {
-        organization: true,
-        client: true,
-        items: true,
-        pdfDocument: true,
-        pdfInternationalDocument: true,
-      },
-    });
-
-    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
-
-    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
-
-    const planId = await this.plan.getPlanIdForUser(dbUserId);
-    this.plan.assertCanSendEmail(planId); // ✅ BASIC/PRO only
-
-    if (
-      invoice.status === InvoiceStatus.PAID ||
-      invoice.status === InvoiceStatus.CANCELLED
-    ) {
-      throw new BadRequestException(
-        `Не можна відправити інвойс зі статусом ${invoice.status}`,
-      );
-    }
-
-    if (!invoice.client || !invoice.client.email) {
-      throw new BadRequestException(
-        'Client email is empty. Fill client.email first.',
-      );
-    }
-
-    const to = invoice.client.email.trim();
-    const orgName = invoice.organization?.name || 'Your company';
-
-    const appUrl = (
-      process.env.APP_PUBLIC_URL || 'http://localhost:3000'
-    ).replace(/\/$/, '');
-    const invoiceUrl = `${appUrl}/invoices/${invoice.id}`;
-
-    const isUa = variant === 'ua';
-    const { pdfBuffer } = isUa
-      ? await this.invoicePdf.getOrCreatePdfForInvoiceUa(invoice.id)
-      : await this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoice.id);
-
-    const money = (v: any) => {
-      if (v == null) return '0.00';
-      if (typeof v === 'number') return v.toFixed(2);
-      if (typeof v === 'string') {
-        const n = parseFloat(v);
-        return Number.isFinite(n) ? n.toFixed(2) : v;
-      }
-      // @ts-ignore
-      if (v && typeof v.toNumber === 'function') return v.toNumber().toFixed(2);
-      return String(v);
-    };
-
-    const totalStr = `${money(invoice.total)} ${invoice.currency || 'UAH'}`;
-
-    const subject = isUa
-      ? `Рахунок-фактура ${invoice.number} від ${orgName}`
-      : `Invoice ${invoice.number} from ${orgName}`;
-
-    const greeting = invoice.client.contactName || invoice.client.name || '';
-
-    const title = isUa ? 'Рахунок-фактура' : 'Invoice';
-    const pdfName = isUa
-      ? `invoice-ua-${invoice.number}.pdf`
-      : `invoice-int-${invoice.number}.pdf`;
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; color: #111827;">
-        <h2>${title}</h2>
-        <p>${isUa ? 'Вітаємо' : 'Hello'} ${greeting},</p>
-
-        <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
-          <div><b>${isUa ? 'Інвойс' : 'Invoice'}:</b> ${invoice.number}</div>
-          <div><b>${isUa ? 'Сума' : 'Total'}:</b> ${totalStr}</div>
-        </div>
-
-        <p style="margin-top:16px;">
-          ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
-        </p>
-
-        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
-          Sent from ${orgName}
-        </p>
-      </div>
-    `;
-
-    await this.email.sendMail({
-      to,
-      subject,
-      html,
-      text: `${title} ${invoice.number}\nTotal: ${totalStr}\n${invoiceUrl}`,
-      attachments: [
-        {
-          filename: pdfName,
-          content: pdfBuffer,
-          contentType: 'application/pdf',
-        },
-      ],
-    });
-
-    const beforeStatus = invoice.status;
-
-    const updated = await this.prisma.invoice.update({
-      where: { id },
-      data: {
-        status: InvoiceStatus.SENT,
-        sentAt: new Date(),
-      },
-      include: { items: true, client: true },
-    });
-
-    await this.activity.create({
-      organizationId: invoice.organizationId,
-      actorUserId: dbUserId,
-      entityType: ActivityEntityType.INVOICE,
-      entityId: invoice.id,
-      eventType: ActivityEventType.SENT,
-      toEmail: to,
-      meta: { invoiceNumber: invoice.number, variant, subject },
-    });
-
-    await this.logStatusChange({
-      organizationId: invoice.organizationId,
-      actorUserId: dbUserId,
-      invoiceId: invoice.id,
-      from: beforeStatus,
-      to: InvoiceStatus.SENT,
-      meta: { via: 'sendInvoiceByEmail' },
-    });
-
-    return updated;
+    return this.sendInvoiceByEmailDbUserId(dbUserId, id, variant);
   }
 
   private async generateInvoiceNumber(organizationId: string): Promise<string> {
@@ -913,12 +777,252 @@ export class InvoicesService {
     return updated;
   }
 
-  // ------------------------------------------------
-  // ✅ ANALYTICS (auth + org access) — BASIC/PRO per your plans
-  // (FREE can be allowed or blocked; your PLANS says "expanded analytics" only PRO,
-  // so here I block analytics on FREE. BASIC you listed as blocked too; so PRO only.
-  // If you want BASIC analytics later — change to plan !== FREE.
-  // ------------------------------------------------
+  async sendInvoiceByEmailDbUserId(
+    dbUserId: string,
+    id: string,
+    variant: 'ua' | 'international' = 'ua',
+  ) {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        organization: true,
+        client: true,
+        items: true,
+        pdfDocument: true,
+        pdfInternationalDocument: true,
+      },
+    });
+
+    if (!invoice) throw new NotFoundException('Інвойс не знайдено');
+
+    await this.plan.assertOrgAccess(dbUserId, invoice.organizationId);
+
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanSendEmail(planId); // PRO ok
+
+    if (
+      invoice.status === InvoiceStatus.PAID ||
+      invoice.status === InvoiceStatus.CANCELLED
+    ) {
+      throw new BadRequestException(
+        `Не можна відправити інвойс зі статусом ${invoice.status}`,
+      );
+    }
+
+    if (!invoice.client || !invoice.client.email) {
+      throw new BadRequestException(
+        'Client email is empty. Fill client.email first.',
+      );
+    }
+
+    const to = invoice.client.email.trim();
+    const orgName = invoice.organization?.name || 'Your company';
+
+    const isUa = variant === 'ua';
+    const { pdfBuffer } = isUa
+      ? await this.invoicePdf.getOrCreatePdfForInvoiceUa(invoice.id)
+      : await this.invoicePdf.getOrCreatePdfForInvoiceInternational(invoice.id);
+
+    const money = (v: any) => {
+      if (v == null) return '0.00';
+      if (typeof v === 'number') return v.toFixed(2);
+      if (typeof v === 'string') {
+        const n = parseFloat(v);
+        return Number.isFinite(n) ? n.toFixed(2) : v;
+      }
+      // @ts-ignore
+      if (v && typeof v.toNumber === 'function') return v.toNumber().toFixed(2);
+      return String(v);
+    };
+
+    const totalStr = `${money(invoice.total)} ${invoice.currency || 'UAH'}`;
+
+    const subject = isUa
+      ? `Рахунок-фактура ${invoice.number} від ${orgName}`
+      : `Invoice ${invoice.number} from ${orgName}`;
+
+    const greeting = invoice.client.contactName || invoice.client.name || '';
+
+    const title = isUa ? 'Рахунок-фактура' : 'Invoice';
+    const pdfName = isUa
+      ? `invoice-ua-${invoice.number}.pdf`
+      : `invoice-int-${invoice.number}.pdf`;
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; color: #111827;">
+        <h2>${title}</h2>
+        <p>${isUa ? 'Вітаємо' : 'Hello'} ${greeting},</p>
+
+        <div style="padding:12px;border:1px solid #e5e7eb;border-radius:10px;">
+          <div><b>${isUa ? 'Інвойс' : 'Invoice'}:</b> ${invoice.number}</div>
+          <div><b>${isUa ? 'Сума' : 'Total'}:</b> ${totalStr}</div>
+        </div>
+
+        <p style="margin-top:16px;">
+          ${isUa ? 'PDF файл у вкладенні.' : 'PDF is attached.'}
+        </p>
+
+        <p style="margin-top:16px;font-size:12px;color:#6b7280;">
+          Sent from ${orgName}
+        </p>
+      </div>
+    `;
+
+    await this.email.sendMail({
+      to,
+      subject,
+      html,
+      text: `${title} ${invoice.number}\nTotal: ${totalStr}`,
+      attachments: [
+        {
+          filename: pdfName,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    const beforeStatus = invoice.status;
+
+    const updated = await this.prisma.invoice.update({
+      where: { id },
+      data: {
+        status: InvoiceStatus.SENT,
+        sentAt: new Date(),
+      },
+      include: { items: true, client: true },
+    });
+
+    await this.activity.create({
+      organizationId: invoice.organizationId,
+      actorUserId: dbUserId,
+      entityType: ActivityEntityType.INVOICE,
+      entityId: invoice.id,
+      eventType: ActivityEventType.SENT,
+      toEmail: to,
+      meta: { invoiceNumber: invoice.number, variant, subject },
+    });
+
+    await this.logStatusChange({
+      organizationId: invoice.organizationId,
+      actorUserId: dbUserId,
+      invoiceId: invoice.id,
+      from: beforeStatus,
+      to: InvoiceStatus.SENT,
+      meta: { via: 'sendInvoiceByEmailDbUserId' },
+    });
+
+    return updated;
+  }
+
+  async createFromTemplateAsDbUser(params: {
+    dbUserId: string;
+    organizationId: string;
+    clientId?: string | null;
+    templateInvoiceId: string;
+    issueDate: Date;
+    dueDate: Date | null;
+    currency?: string | null;
+    notes?: string | null;
+    recurringProfileId: string;
+  }) {
+    const {
+      dbUserId,
+      organizationId,
+      clientId,
+      templateInvoiceId,
+      issueDate,
+      dueDate,
+      currency,
+      notes,
+      recurringProfileId,
+    } = params;
+
+    await this.plan.assertOrgAccess(dbUserId, organizationId);
+
+    // PRO only recurring
+    const planId = await this.plan.getPlanIdForUser(dbUserId);
+    this.plan.assertCanUseRecurringInvoices(planId);
+
+    // still respect invoice limits (PRO unlimited anyway, but keep consistent)
+    await this.plan.assertInvoicesLimit(dbUserId, organizationId);
+
+    const tpl = await this.prisma.invoice.findUnique({
+      where: { id: templateInvoiceId },
+      include: { items: true },
+    });
+    if (!tpl) throw new NotFoundException('Template invoice not found');
+    if (tpl.organizationId !== organizationId) {
+      throw new BadRequestException('Template invoice belongs to another org');
+    }
+    if (!tpl.items || tpl.items.length === 0) {
+      throw new BadRequestException('Template invoice has no items');
+    }
+
+    const items = tpl.items.map((it) => ({
+      name: it.name,
+      description: it.description ?? null,
+      quantity: it.quantity,
+      unitPrice: Number(it.unitPrice),
+      taxRate: it.taxRate == null ? undefined : Number(it.taxRate),
+    }));
+
+    const { subtotal, taxAmount, total, lineTotals } =
+      this.calculateTotals(items);
+
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const number = await this.generateInvoiceNumber(organizationId);
+
+      try {
+        const invoice = await this.prisma.invoice.create({
+          data: {
+            organizationId,
+            createdById: dbUserId,
+            clientId: clientId ?? null,
+
+            number,
+            issueDate,
+            dueDate,
+
+            currency: currency ?? tpl.currency ?? 'UAH',
+            status: InvoiceStatus.DRAFT,
+            notes: notes ?? tpl.notes ?? null,
+
+            subtotal,
+            taxAmount,
+            total,
+
+            sentAt: null,
+            paidAt: null,
+
+            recurringProfileId,
+
+            items: {
+              create: items.map((item, index) => ({
+                name: item.name,
+                description: item.description ?? null,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                taxRate: item.taxRate ?? null,
+                lineTotal: lineTotals[index].lineTotal,
+              })),
+            },
+          } as any,
+          include: { items: true, client: true },
+        });
+
+        return invoice;
+      } catch (e: any) {
+        if (this.isUniqueNumberError(e) && attempt < maxAttempts) continue;
+        throw e;
+      }
+    }
+
+    throw new BadRequestException('Failed to generate invoice number');
+  }
+
   async getAnalytics(params: {
     authUserId: string;
     organizationId: string;
