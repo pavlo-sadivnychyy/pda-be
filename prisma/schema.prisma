@@ -97,6 +97,27 @@ enum ActStatus {
   CANCELLED
 }
 
+enum ExpensePlanStatus {
+  OPEN
+  CLOSED
+  ARCHIVED
+}
+
+enum ExpenseItemType {
+  PLANNED
+  ACTUAL
+}
+
+enum ExpenseItemStatus {
+  ACTIVE
+  DONE
+  SKIPPED
+}
+
+enum ExpenseRecurrenceUnit {
+  MONTH
+}
+
 // ================== MODELS ==================
 
 // ---- User ----
@@ -142,6 +163,10 @@ model User {
   taxProfiles              TaxProfile[]
   taxEventTemplates        TaxEventTemplate[]
   taxEventInstances        TaxEventInstance[]
+  expensePlans             ExpenseMonthPlan[]
+  expenseCategories        ExpenseCategory[]
+  expenseItems             ExpenseItem[]
+  expenseRecurringRules    ExpenseRecurringRule[]
 }
 
 // ---- Organization ----
@@ -922,4 +947,127 @@ model TaxEventAttachment {
 
   @@index([eventId])
   @@index([documentId])
+}
+
+model ExpenseMonthPlan {
+  id     String @id @default(cuid())
+  userId String
+
+  // формат: 2026-03
+  monthKey  String
+  monthDate DateTime
+  currency  String            @default("UAH")
+  status    ExpensePlanStatus @default(OPEN)
+
+  incomePlanned Decimal? @db.Decimal(18, 2)
+  incomeActual  Decimal? @db.Decimal(18, 2)
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id])
+  categories ExpenseCategory[]
+  items      ExpenseItem[]
+
+  @@unique([userId, monthKey])
+  @@index([userId, monthDate])
+}
+
+model ExpenseCategory {
+  id     String  @id @default(cuid())
+  userId String
+  planId String?
+
+  name      String
+  icon      String?
+  color     String?
+  sortOrder Int     @default(0)
+
+  // системні стартові категорії типу "Їжа", "Оренда", "Реклама"
+  isSystem Boolean @default(false)
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User              @relation(fields: [userId], references: [id])
+  plan ExpenseMonthPlan? @relation(fields: [planId], references: [id])
+
+  items          ExpenseItem[]
+  recurringRules ExpenseRecurringRule[]
+
+  @@index([userId, isActive])
+  @@index([planId, sortOrder])
+}
+
+model ExpenseItem {
+  id         String  @id @default(cuid())
+  userId     String
+  planId     String
+  categoryId String?
+
+  title      String
+  note       String?
+  vendorName String?
+
+  type   ExpenseItemType   @default(PLANNED)
+  status ExpenseItemStatus @default(ACTIVE)
+
+  amountPlanned Decimal? @db.Decimal(18, 2)
+  amountActual  Decimal? @db.Decimal(18, 2)
+  currency      String   @default("UAH")
+
+  expenseDate DateTime
+  paidAt      DateTime?
+
+  isRecurringGenerated Boolean @default(false)
+  recurringRuleId      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User                  @relation(fields: [userId], references: [id])
+  plan          ExpenseMonthPlan      @relation(fields: [planId], references: [id])
+  category      ExpenseCategory?      @relation(fields: [categoryId], references: [id])
+  recurringRule ExpenseRecurringRule? @relation(fields: [recurringRuleId], references: [id])
+
+  @@index([userId, expenseDate])
+  @@index([planId, type])
+  @@index([categoryId, expenseDate])
+  @@index([recurringRuleId])
+}
+
+model ExpenseRecurringRule {
+  id         String  @id @default(cuid())
+  userId     String
+  categoryId String?
+
+  title      String
+  note       String?
+  vendorName String?
+
+  amount   Decimal @db.Decimal(18, 2)
+  currency String  @default("UAH")
+
+  // наприклад 5 число кожного місяця
+  dayOfMonth     Int
+  recurrenceUnit ExpenseRecurrenceUnit @default(MONTH)
+
+  // формат: 2026-03
+  startMonthKey String
+  endMonthKey   String?
+
+  isActive              Boolean @default(true)
+  lastGeneratedMonthKey String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User             @relation(fields: [userId], references: [id])
+  category ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  items    ExpenseItem[]
+
+  @@index([userId, isActive])
+  @@index([userId, startMonthKey])
 }

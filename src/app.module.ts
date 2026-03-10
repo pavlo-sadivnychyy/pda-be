@@ -18,6 +18,7 @@ import { ServicesModule } from './services/services.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { RecurringInvoicesModule } from './recurring-invoices/recurring-invoices.module';
 import { TaxCalendarModule } from './tax-calendar/tax-calendar.module';
+import { ExpensePlannerModule } from './expense-planner/expense-planner.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { TaxCalendarModule } from './tax-calendar/tax-calendar.module';
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
     TaxCalendarModule,
+    ExpensePlannerModule,
   ],
   controllers: [AppController],
   providers: [AppService],
